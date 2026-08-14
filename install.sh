@@ -2,8 +2,8 @@
 
 set -Eeuo pipefail
 
-readonly ZP_VERSION="0.4.2"
-readonly ZP_MAIN_URL="https://raw.githubusercontent.com/zenpe/zenproxy/v${ZP_VERSION}/zenproxy"
+readonly ZP_CHANNEL="main"
+readonly ZP_MAIN_URL="https://raw.githubusercontent.com/zenpe/zenproxy/${ZP_CHANNEL}/zenproxy"
 
 tmp=$(mktemp)
 cleanup() {

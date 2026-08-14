@@ -35,14 +35,16 @@ chmod +x zenproxy
 sudo ./zenproxy
 ```
 
-远程一键安装（固定版本）：
+远程一键安装（跟随 main 稳定分支）：
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/zenpe/zenproxy/v0.4.2/install.sh) \
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/zenpe/zenproxy/main/install.sh) \
   install --tunnel-domain cf.example.com
 ```
 
 不带 `install` 参数会进入中文菜单。安装时会打开 Cloudflare 浏览器授权，不需要预先创建 DNS 记录或提供 Tunnel Token。
+
+需要固定历史版本时，可将地址中的 `main` 替换为对应的 Git tag，例如 `v0.4.2`。
 
 也可以先预演：
 
