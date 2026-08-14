@@ -1,0 +1,1592 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+
+readonly ZP_VERSION="0.4.2"
+readonly XRAY_VERSION="v26.3.27"
+readonly CLOUDFLARED_VERSION="2026.8.1"
+readonly HY2_CERT_NAME="www.bing.com"
+
+readonly ZP_CONFIG_DIR="${ZENPROXY_CONFIG_DIR:-/etc/zenproxy}"
+readonly ZP_CREDENTIAL_DIR="$ZP_CONFIG_DIR/credentials"
+readonly ZP_TLS_DIR="$ZP_CONFIG_DIR/tls"
+readonly ZP_STATE_DIR="${ZENPROXY_STATE_DIR:-/var/lib/zenproxy}"
+readonly ZP_STATE_FILE="$ZP_STATE_DIR/state.json"
+readonly ZP_INSTALL_DIR="${ZENPROXY_INSTALL_DIR:-/usr/local/lib/zenproxy}"
+readonly ZP_BIN_DIR="$ZP_INSTALL_DIR/bin"
+readonly ZP_SYSTEMD_DIR="${ZENPROXY_SYSTEMD_DIR:-/etc/systemd/system}"
+readonly ZP_LOCK_FILE="${ZENPROXY_LOCK_FILE:-/run/lock/zenproxy.lock}"
+
+readonly XRAY_BIN="$ZP_BIN_DIR/xray"
+readonly CLOUDFLARED_BIN="$ZP_BIN_DIR/cloudflared"
+readonly XRAY_SERVICE="zenproxy-xray.service"
+readonly CLOUDFLARED_SERVICE="zenproxy-cloudflared.service"
+
+DRY_RUN=0
+ASSUME_YES=0
+SHOW_SECRETS=0
+INSTALL_ACTIVE=0
+MANAGER_COMMAND_INSTALLED=0
+UNITS_INSTALLED=0
+CREATED_TUNNEL_ID=""
+CREATED_TUNNEL_HOME=""
+CREATED_USERS=()
+
+if [[ -t 1 ]]; then
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+  C_BOLD=$'\033[1m'
+  C_RESET=$'\033[0m'
+else
+  C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_BOLD="" C_RESET=""
+fi
+
+log() { printf '%s\n' "$*"; }
+info() { printf '%s[信息]%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
+ok() { printf '%s[正常]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%s[注意]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die() { printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+quote_cmd() {
+  local arg
+  printf '+'
+  for arg in "$@"; do printf ' %q' "$arg"; done
+  printf '\n'
+}
+
+run() {
+  if (( DRY_RUN )); then
+    quote_cmd "$@"
+    return 0
+  fi
+  "$@"
+}
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+require_root() {
+  (( EUID == 0 )) || die "该操作需要 root 权限，请使用 sudo。"
+}
+
+acquire_lock() {
+  command_exists flock || die "缺少 flock，请安装 util-linux。"
+  mkdir -p "$(dirname "$ZP_LOCK_FILE")"
+  exec 9>"$ZP_LOCK_FILE"
+  flock -n 9 || die "另一个 ZenProxy 操作正在运行。"
+}
+
+is_installed() { [[ -s "$ZP_STATE_FILE" ]]; }
+
+require_installed() {
+  is_installed || die "ZenProxy 尚未安装，请先运行：sudo zenproxy install"
+}
+
+state_get() {
+  local expression=$1
+  jq -er "$expression" "$ZP_STATE_FILE"
+}
+
+stored_direct_ipv4() {
+  jq -r '.direct_ipv4 // (if (.direct_address | contains(":")) then "" else .direct_address end)' "$ZP_STATE_FILE"
+}
+
+stored_direct_ipv6() {
+  jq -r '.direct_ipv6 // (if (.direct_address | contains(":")) then .direct_address else "" end)' "$ZP_STATE_FILE"
+}
+
+trim() {
+  local value=$1
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+validate_domain() {
+  local domain=${1,,}
+  [[ ${#domain} -le 253 ]] || return 1
+  [[ "$domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]
+}
+
+validate_port() {
+  local port=$1
+  [[ "$port" =~ ^[1-9][0-9]*$ && ${#port} -le 5 ]] && (( 10#$port <= 65535 ))
+}
+
+prompt_value() {
+  local prompt=$1 default=${2:-} result
+  if [[ -n "$default" ]]; then
+    read -r -p "$prompt [$default]: " result
+    result=${result:-$default}
+  else
+    read -r -p "$prompt: " result
+  fi
+  trim "$result"
+}
+
+confirm() {
+  local prompt=$1 answer
+  (( ASSUME_YES )) && return 0
+  read -r -p "$prompt [y/N]: " answer
+  [[ "$answer" =~ ^([Yy]|[Yy][Ee][Ss]|是)$ ]]
+}
+
+cancelled() {
+  info "操作已取消。"
+  return 0
+}
+
+mask_secret() {
+  local value=$1 length=${#1}
+  if (( length <= 8 )); then
+    printf '********'
+  else
+    printf '%s...%s' "${value:0:4}" "${value:length-4:4}"
+  fi
+}
+
+random_urlsafe() {
+  local bytes=${1:-24}
+  openssl rand -base64 "$bytes" | tr '+/' '-_' | tr -d '=\n'
+}
+
+architecture() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'amd64' ;;
+    aarch64|arm64) printf 'arm64' ;;
+    *) die "暂不支持 CPU 架构：$(uname -m)" ;;
+  esac
+}
+
+service_active() {
+  systemctl is-active --quiet "$1"
+}
+
+port_in_use() {
+  local protocol=$1 port=$2
+  if [[ "$protocol" == tcp ]]; then
+    ss -H -lnt | awk -v port=":$port" '$4 ~ (port "$") { found=1 } END { exit !found }'
+  else
+    ss -H -lnu | awk -v port=":$port" '$4 ~ (port "$") { found=1 } END { exit !found }'
+  fi
+}
+
+show_banner() {
+  printf '%sZenProxy%s %s\n' "$C_BOLD" "$C_RESET" "$ZP_VERSION"
+  printf 'Cloudflare主线路 + HY2/REALITY直连备用\n\n'
+}
+
+usage() {
+  cat <<'EOF'
+用法：zenproxy <命令> [选项]
+
+命令：
+  install       全新安装
+  status        查看服务和端口状态
+  check         执行一键诊断
+  info          查看节点信息
+  export        导出分享链接、Mihomo和sing-box配置
+  start         启动全部服务
+  stop          停止全部服务
+  restart       重启全部服务或指定组件
+  logs [组件]   查看最近日志（xray或cloudflared）
+  update        事务更新核心程序及可选管理器
+  uninstall     卸载本机 ZenProxy
+  version       显示版本
+
+常用选项：
+  --dry-run             只显示计划，不执行变更
+  --yes                 跳过普通确认
+  --show-secrets        显示完整节点链接
+  --clash               info输出Mihomo/Clash.Meta节点YAML
+  --tunnel-domain NAME  Cloudflare Tunnel域名
+  --vless-port PORT     VLESS TCP端口，默认8443
+  --hy2-port PORT       HY2 UDP端口，默认443
+  --direct-ipv4 ADDR    手动指定直连IPv4地址
+  --direct-ipv6 ADDR    手动指定直连IPv6地址
+  --force-domain        明确允许覆盖已有Tunnel域名
+  --delete-tunnel       uninstall时同时删除Cloudflare Tunnel（需要浏览器授权）
+  --output DIR           export输出到指定的新目录
+  --manager-file FILE   update时同时安装新的管理器脚本
+  --manager-sha256 HASH 新管理器脚本的SHA256摘要
+
+不带命令运行时进入中文菜单。简写命令：zp
+EOF
+}
+
+on_error() {
+  local exit_code=$? line=${BASH_LINENO[0]:-unknown}
+  printf '%s[失败]%s 第 %s 行执行失败，退出码 %s。\n' "$C_RED" "$C_RESET" "$line" "$exit_code" >&2
+  if (( INSTALL_ACTIVE )); then
+    warn "安装未完成，将回滚本次创建的本地资源和Tunnel。"
+  fi
+  exit "$exit_code"
+}
+
+cleanup_partial_install() {
+  local user
+  set +e
+  if (( UNITS_INSTALLED )); then
+    systemctl disable --now "$XRAY_SERVICE" "$CLOUDFLARED_SERVICE" >/dev/null 2>&1
+    rm -f "$ZP_SYSTEMD_DIR/$XRAY_SERVICE" "$ZP_SYSTEMD_DIR/$CLOUDFLARED_SERVICE"
+    systemctl daemon-reload >/dev/null 2>&1
+  fi
+  if [[ -n "$CREATED_TUNNEL_ID" && -x "$CLOUDFLARED_BIN" && -d "$CREATED_TUNNEL_HOME" ]]; then
+    HOME="$CREATED_TUNNEL_HOME" "$CLOUDFLARED_BIN" tunnel delete -f "$CREATED_TUNNEL_ID" >/dev/null 2>&1 || true
+  fi
+  [[ "$ZP_CONFIG_DIR" == /etc/zenproxy ]] && rm -rf -- "$ZP_CONFIG_DIR"
+  [[ "$ZP_STATE_DIR" == /var/lib/zenproxy ]] && rm -rf -- "$ZP_STATE_DIR"
+  [[ "$ZP_INSTALL_DIR" == /usr/local/lib/zenproxy ]] && rm -rf -- "$ZP_INSTALL_DIR"
+  for user in "${CREATED_USERS[@]}"; do
+    userdel "$user" >/dev/null 2>&1
+  done
+  if (( MANAGER_COMMAND_INSTALLED )); then
+    rm -f /usr/local/sbin/zp /usr/local/sbin/zenproxy
+  fi
+  set -e
+}
+
+on_exit() {
+  local exit_code=$1
+  if (( INSTALL_ACTIVE )); then
+    warn "安装失败，正在清理ZenProxy本地文件。"
+    cleanup_partial_install
+    warn "已尝试删除本次创建的Tunnel；请在Cloudflare控制台确认DNS记录。"
+  fi
+  return "$exit_code"
+}
+
+trap on_error ERR
+trap 'on_exit $?' EXIT
+
+validate_platform_version() {
+  local distribution=$1 version=$2 major minor
+  major=${version%%.*}
+  minor=${version#*.}
+  minor=${minor%%.*}
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+  major=$((10#$major))
+  minor=$((10#$minor))
+  case "$distribution" in
+    debian) (( major >= 12 )) ;;
+    ubuntu) (( major > 22 || (major == 22 && minor >= 4) )) ;;
+    *) return 1 ;;
+  esac
+}
+
+check_platform() {
+  [[ "$(uname -s)" == Linux ]] || die "ZenProxy 仅支持 Linux。"
+  command_exists systemctl || die "当前系统没有 systemd。"
+  [[ -d /run/systemd/system ]] || die "当前系统未运行 systemd。"
+  [[ -r /etc/os-release ]] || die "无法识别操作系统。"
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  validate_platform_version "${ID:-}" "${VERSION_ID:-}" || \
+    die "第一版仅支持 Debian 12+ 和 Ubuntu 22.04+。当前系统：${PRETTY_NAME:-未知}"
+  architecture >/dev/null
+}
+
+install_dependencies() {
+  info "安装基础依赖"
+  run env DEBIAN_FRONTEND=noninteractive apt-get update
+  run env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    ca-certificates curl iproute2 jq openssl qrencode unzip util-linux
+}
+
+github_asset_metadata() {
+  local repository=$1 tag=$2 asset=$3 encoded_tag response
+  encoded_tag=$(printf '%s' "$tag" | jq -sRr @uri)
+  response=$(curl -fsSL --retry 3 --connect-timeout 10 \
+    "https://api.github.com/repos/$repository/releases/tags/$encoded_tag")
+  jq -er --arg asset "$asset" \
+    '.assets[] | select(.name == $asset) | {url:.browser_download_url,digest:(.digest // "")}' \
+    <<<"$response"
+}
+
+download_github_asset() {
+  local repository=$1 tag=$2 asset=$3 destination=$4 metadata url digest expected actual temporary
+  metadata=$(github_asset_metadata "$repository" "$tag" "$asset") || \
+    die "找不到官方发布文件：$repository $tag $asset"
+  url=$(jq -er '.url' <<<"$metadata")
+  digest=$(jq -r '.digest' <<<"$metadata")
+  [[ "$digest" == sha256:* ]] || \
+    die "GitHub未提供 $asset 的SHA256摘要，已拒绝不校验下载。"
+  expected=${digest#sha256:}
+  temporary=$(mktemp "$ZP_STATE_DIR/.download.XXXXXX")
+  curl -fL --retry 3 --connect-timeout 10 --output "$temporary" "$url"
+  actual=$(sha256sum "$temporary" | awk '{print $1}')
+  [[ "$actual" == "$expected" ]] || {
+    rm -f "$temporary"
+    die "$asset 校验失败。"
+  }
+  install -m 0755 "$temporary" "$destination"
+  rm -f "$temporary"
+}
+
+install_core_binaries() {
+  local target_dir=${1:-$ZP_BIN_DIR} xray_version=${2:-$XRAY_VERSION}
+  local cloudflared_version=${3:-$CLOUDFLARED_VERSION} arch xray_asset archive unpack_dir
+  arch=$(architecture)
+  install -d -m 0755 "$ZP_INSTALL_DIR" "$target_dir"
+  install -d -m 0750 "$ZP_STATE_DIR"
+
+  case "$arch" in
+    amd64) xray_asset="Xray-linux-64.zip" ;;
+    arm64) xray_asset="Xray-linux-arm64-v8a.zip" ;;
+  esac
+
+  info "下载并校验 Xray $xray_version"
+  archive=$(mktemp "$ZP_STATE_DIR/.xray.XXXXXX.zip")
+  download_github_asset "XTLS/Xray-core" "$xray_version" "$xray_asset" "$archive"
+  unpack_dir=$(mktemp -d "$ZP_STATE_DIR/.xray-unpack.XXXXXX")
+  unzip -q "$archive" xray -d "$unpack_dir"
+  install -m 0755 "$unpack_dir/xray" "$target_dir/xray"
+  rm -rf "$archive" "$unpack_dir"
+
+  info "下载并校验 cloudflared $cloudflared_version"
+  download_github_asset "cloudflare/cloudflared" "$cloudflared_version" \
+    "cloudflared-linux-$arch" "$target_dir/cloudflared"
+
+  local version_text
+  version_text=$("$target_dir/xray" version)
+  printf '%s\n' "${version_text%%$'\n'*}"
+  version_text=$("$target_dir/cloudflared" --version)
+  printf '%s\n' "${version_text%%$'\n'*}"
+}
+
+create_system_user() {
+  local user=$1
+  getent passwd "$user" >/dev/null && \
+    die "系统用户 $user 已存在，无法确认其归属。请先检查同名服务或残留安装。"
+  run useradd --system --user-group --home-dir /nonexistent --shell /usr/sbin/nologin "$user"
+  CREATED_USERS+=("$user")
+}
+
+check_install_targets() {
+  local target
+  for target in "$ZP_CONFIG_DIR" "$ZP_STATE_DIR" "$ZP_INSTALL_DIR" \
+    /usr/local/sbin/zenproxy /usr/local/sbin/zp \
+    "$ZP_SYSTEMD_DIR/$XRAY_SERVICE" "$ZP_SYSTEMD_DIR/$CLOUDFLARED_SERVICE"; do
+    [[ ! -e "$target" && ! -L "$target" ]] || die "检测到已有路径，拒绝覆盖：$target"
+  done
+  check_install_users
+}
+
+check_install_users() {
+  local user
+  for user in zenproxy-xray zenproxy-cloudflared; do
+    if getent passwd "$user" >/dev/null; then
+      die "检测到已有系统用户，拒绝复用：$user"
+    fi
+  done
+}
+
+prepare_directories() {
+  install -d -m 0755 -o root -g root "$ZP_CONFIG_DIR"
+  install -d -m 0750 -o root -g root "$ZP_STATE_DIR"
+  install -d -m 0711 -o root -g root "$ZP_CREDENTIAL_DIR"
+  install -d -m 0750 -o root -g zenproxy-xray "$ZP_TLS_DIR"
+}
+
+write_secret() {
+  local name=$1 value=$2 group=${3:-root}
+  printf '%s\n' "$value" >"$ZP_CREDENTIAL_DIR/$name"
+  chown root:"$group" "$ZP_CREDENTIAL_DIR/$name"
+  chmod 0640 "$ZP_CREDENTIAL_DIR/$name"
+}
+
+read_secret() {
+  local name=$1
+  tr -d '\r\n' <"$ZP_CREDENTIAL_DIR/$name"
+}
+
+generate_credentials() {
+  local key_pair private_key public_key uuid hy2_password short_id ws_path
+  uuid=$($XRAY_BIN uuid)
+  key_pair=$($XRAY_BIN x25519)
+  private_key=$(awk -F: '/PrivateKey/ {gsub(/[[:space:]]/, "", $2); print $2}' <<<"$key_pair")
+  public_key=$(awk -F: '/PublicKey|Password/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' <<<"$key_pair")
+  [[ -n "$private_key" && -n "$public_key" ]] || die "无法生成 REALITY 密钥。"
+  hy2_password=$(random_urlsafe 24)
+  short_id=$(openssl rand -hex 8)
+  ws_path="/$(random_urlsafe 18)"
+
+  write_secret "vless.uuid" "$uuid" zenproxy-xray
+  write_secret "reality.private-key" "$private_key" zenproxy-xray
+  write_secret "reality.public-key" "$public_key"
+  write_secret "reality.short-id" "$short_id" zenproxy-xray
+  write_secret "hysteria.password" "$hy2_password" zenproxy-xray
+  write_secret "ws.path" "$ws_path" zenproxy-xray
+}
+
+valid_ipv4_address() {
+  local address=$1 octet
+  local -a octets=()
+  local IFS=.
+  read -r -a octets <<<"$address"
+  ((${#octets[@]} == 4)) || return 1
+  for octet in "${octets[@]}"; do
+    [[ "$octet" =~ ^[0-9]{1,3}$ ]] && (( 10#$octet <= 255 )) || return 1
+  done
+}
+
+valid_ipv6_address() {
+  local address=$1 resolved
+  [[ "$address" == *:* && "$address" =~ ^[0-9a-fA-F:]+$ ]] || return 1
+  resolved=$(getent ahosts "$address" 2>/dev/null | awk 'NR == 1 {print $1}')
+  [[ "$resolved" == *:* ]]
+}
+
+public_ipv4() {
+  local endpoint address
+  for endpoint in https://api.ipify.org https://icanhazip.com https://ifconfig.co/ip; do
+    address=$(curl -4fsS --max-time 8 "$endpoint" 2>/dev/null | tr -d '[:space:]' || true)
+    if valid_ipv4_address "$address"; then
+      printf '%s' "$address"
+      return 0
+    fi
+  done
+  return 1
+}
+
+public_ipv6() {
+  local endpoint address
+  for endpoint in https://api6.ipify.org https://icanhazip.com https://ifconfig.co/ip; do
+    address=$(curl -6fsS --max-time 8 "$endpoint" 2>/dev/null | tr -d '[:space:]' || true)
+    if valid_ipv6_address "$address"; then
+      printf '%s' "$address"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ipv6_dual_stack_available() {
+  [[ -s /proc/net/if_inet6 ]] || return 1
+  [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || printf '1')" == 0 ]] || return 1
+  [[ "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || printf '1')" == 0 ]]
+}
+
+inbound_listen_address() {
+  if ipv6_dual_stack_available; then
+    printf '::'
+  else
+    printf '0.0.0.0'
+  fi
+}
+
+uri_host() {
+  local address=$1
+  if [[ "$address" == *:* ]]; then
+    printf '[%s]' "$address"
+  else
+    printf '%s' "$address"
+  fi
+}
+
+check_port_conflicts() {
+  local vless_port=$1 hy2_port=$2 conflict=0
+  if port_in_use tcp "$vless_port"; then warn "TCP $vless_port 已被占用。"; conflict=1; fi
+  if port_in_use udp "$hy2_port"; then warn "UDP $hy2_port 已被占用。"; conflict=1; fi
+  if port_in_use tcp 17122; then warn "TCP 17122 已被占用。"; conflict=1; fi
+  (( conflict == 0 )) || die "请先处理端口冲突。ZenProxy不会停止或修改现有服务。"
+}
+
+generate_self_signed_certificate() {
+  info "生成HY2自签证书和固定指纹"
+  openssl ecparam -genkey -name prime256v1 -out "$ZP_TLS_DIR/privkey.pem"
+  openssl req -new -x509 -sha256 -days 3650 \
+    -key "$ZP_TLS_DIR/privkey.pem" \
+    -out "$ZP_TLS_DIR/fullchain.pem" \
+    -subj "/CN=$HY2_CERT_NAME" \
+    -addext "subjectAltName=DNS:$HY2_CERT_NAME"
+  chown root:zenproxy-xray "$ZP_TLS_DIR/privkey.pem" "$ZP_TLS_DIR/fullchain.pem"
+  chmod 0640 "$ZP_TLS_DIR/privkey.pem" "$ZP_TLS_DIR/fullchain.pem"
+  openssl x509 -in "$ZP_TLS_DIR/fullchain.pem" -outform DER | \
+    sha256sum | awk '{print $1}' >"$ZP_CREDENTIAL_DIR/tls.fingerprint"
+  chown root:root "$ZP_CREDENTIAL_DIR/tls.fingerprint"
+  chmod 0640 "$ZP_CREDENTIAL_DIR/tls.fingerprint"
+}
+
+setup_cloudflare_tunnel() {
+  local tunnel_domain=$1 tunnel_name=$2 result_variable=$3 force_domain=${4:-0}
+  local cf_home created_tunnel_id source_credential
+  cf_home="$ZP_STATE_DIR/cloudflare-home"
+  install -d -m 0700 "$cf_home/.cloudflared"
+
+  info "接下来需要浏览器授权：请打开终端显示的链接，选择托管该子域名的根域名，授权完成后回到此终端。"
+  info "不需要预先创建DNS记录或提供Tunnel Token；每台VPS请使用不同的子域名。"
+  HOME="$cf_home" "$CLOUDFLARED_BIN" tunnel login
+  HOME="$cf_home" "$CLOUDFLARED_BIN" tunnel create "$tunnel_name"
+  created_tunnel_id=$(HOME="$cf_home" "$CLOUDFLARED_BIN" tunnel list --output json | \
+    jq -er --arg name "$tunnel_name" '[.[] | select(.name == $name)] | last | .id')
+  [[ "$created_tunnel_id" =~ ^[0-9a-fA-F-]{36}$ ]] || die "无法取得 Cloudflare Tunnel ID。"
+  CREATED_TUNNEL_ID=$created_tunnel_id
+  CREATED_TUNNEL_HOME=$cf_home
+  if (( force_domain )); then
+    warn "正在按用户要求覆盖已有DNS记录：$tunnel_domain"
+    HOME="$cf_home" "$CLOUDFLARED_BIN" tunnel route dns --overwrite-dns \
+      "$created_tunnel_id" "$tunnel_domain"
+  elif ! HOME="$cf_home" "$CLOUDFLARED_BIN" tunnel route dns \
+      "$created_tunnel_id" "$tunnel_domain"; then
+    warn "Tunnel域名可能已经被其他Tunnel或DNS记录使用：$tunnel_domain"
+    warn "请为每台VPS使用不同子域名；确认需要接管时才使用 --force-domain。"
+    return 1
+  fi
+
+  source_credential="$cf_home/.cloudflared/$created_tunnel_id.json"
+  [[ -s "$source_credential" ]] || die "Cloudflare Tunnel凭据文件不存在。"
+  install -m 0640 "$source_credential" "$ZP_CREDENTIAL_DIR/cloudflared.json"
+  chown root:zenproxy-cloudflared "$ZP_CREDENTIAL_DIR/cloudflared.json"
+  printf -v "$result_variable" '%s' "$created_tunnel_id"
+}
+
+write_xray_config() {
+  local reality_sni=$1 vless_port=$2 hy2_port=$3 uuid private_key short_id ws_path hy2_password listen_address
+  uuid=$(read_secret "vless.uuid")
+  private_key=$(read_secret "reality.private-key")
+  short_id=$(read_secret "reality.short-id")
+  ws_path=$(read_secret "ws.path")
+  hy2_password=$(read_secret "hysteria.password")
+  listen_address=$(inbound_listen_address)
+
+  jq -n \
+    --arg reality_sni "$reality_sni" \
+    --arg uuid "$uuid" \
+    --arg private_key "$private_key" \
+    --arg short_id "$short_id" \
+    --arg ws_path "$ws_path" \
+    --arg hy2_password "$hy2_password" \
+    --arg listen_address "$listen_address" \
+    --arg cert_file "$ZP_TLS_DIR/fullchain.pem" \
+    --arg key_file "$ZP_TLS_DIR/privkey.pem" \
+    --argjson vless_port "$vless_port" \
+    --argjson hy2_port "$hy2_port" \
+    '{
+      log:{loglevel:"warning"},
+      inbounds:[
+        {
+          tag:"vless-reality-direct",listen:$listen_address,port:$vless_port,protocol:"vless",
+          settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:"none"},
+          streamSettings:{
+            network:"raw",security:"reality",
+            realitySettings:{
+              target:($reality_sni + ":443"),serverNames:[$reality_sni],
+              privateKey:$private_key,shortIds:[$short_id]
+            }
+          },
+          sniffing:{enabled:true,destOverride:["http","tls","quic"],metadataOnly:false}
+        },
+        {
+          tag:"hysteria2-direct",listen:$listen_address,port:$hy2_port,protocol:"hysteria",
+          settings:{version:2,clients:[{auth:$hy2_password}]},
+          streamSettings:{
+            network:"hysteria",security:"tls",
+            tlsSettings:{
+              alpn:["h3"],
+              certificates:[{certificateFile:$cert_file,keyFile:$key_file}]
+            }
+          },
+          sniffing:{enabled:true,destOverride:["http","tls","quic"],metadataOnly:false}
+        },
+        {
+          tag:"vless-ws-cloudflare",listen:"127.0.0.1",port:17122,protocol:"vless",
+          settings:{clients:[{id:$uuid}],decryption:"none"},
+          streamSettings:{network:"ws",security:"none",wsSettings:{path:$ws_path}},
+          sniffing:{enabled:true,destOverride:["http","tls"],metadataOnly:false}
+        }
+      ],
+      outbounds:[
+        {tag:"direct",protocol:"freedom",settings:{domainStrategy:"UseIP"}},
+        {tag:"blocked",protocol:"blackhole"}
+      ]
+    }' >"$ZP_CONFIG_DIR/xray.tmp.json"
+  chown root:zenproxy-xray "$ZP_CONFIG_DIR/xray.tmp.json"
+  chmod 0640 "$ZP_CONFIG_DIR/xray.tmp.json"
+  "$XRAY_BIN" run -test -config "$ZP_CONFIG_DIR/xray.tmp.json"
+  mv "$ZP_CONFIG_DIR/xray.tmp.json" "$ZP_CONFIG_DIR/xray.json"
+}
+
+write_cloudflared_config() {
+  local tunnel_id=$1 tunnel_domain=$2
+  cat >"$ZP_CONFIG_DIR/cloudflared.yml.tmp" <<EOF
+tunnel: $tunnel_id
+credentials-file: $ZP_CREDENTIAL_DIR/cloudflared.json
+protocol: auto
+edge-ip-version: auto
+ingress:
+  - hostname: $tunnel_domain
+    service: http://127.0.0.1:17122
+  - service: http_status:404
+EOF
+  chown root:zenproxy-cloudflared "$ZP_CONFIG_DIR/cloudflared.yml.tmp"
+  chmod 0640 "$ZP_CONFIG_DIR/cloudflared.yml.tmp"
+  mv "$ZP_CONFIG_DIR/cloudflared.yml.tmp" "$ZP_CONFIG_DIR/cloudflared.yml"
+}
+
+write_state() {
+  local direct_address=$1 direct_ipv4=$2 direct_ipv6=$3 tunnel_domain=$4 reality_sni=$5 tunnel_id=$6 tunnel_name=$7 vless_port=$8 hy2_port=$9
+  jq -n \
+    --arg schema "2" \
+    --arg version "$ZP_VERSION" \
+    --arg direct_address "$direct_address" \
+    --arg direct_ipv4 "$direct_ipv4" \
+    --arg direct_ipv6 "$direct_ipv6" \
+    --arg tunnel_domain "$tunnel_domain" \
+    --arg reality_sni "$reality_sni" \
+    --arg tunnel_id "$tunnel_id" \
+    --arg tunnel_name "$tunnel_name" \
+    --argjson vless_port "$vless_port" \
+    --argjson hy2_port "$hy2_port" \
+    --arg installed_at "$(date --iso-8601=seconds)" \
+    '{schema:($schema|tonumber),manager_version:$version,direct_address:$direct_address,
+      direct_ipv4:$direct_ipv4,direct_ipv6:$direct_ipv6,
+      tunnel_domain:$tunnel_domain,reality_sni:$reality_sni,
+      tunnel_id:$tunnel_id,tunnel_name:$tunnel_name,
+      managed_users:["zenproxy-xray","zenproxy-cloudflared"],
+      vless_port:$vless_port,hy2_port:$hy2_port,installed_at:$installed_at}' >"$ZP_STATE_FILE.tmp"
+  chmod 0600 "$ZP_STATE_FILE.tmp"
+  mv "$ZP_STATE_FILE.tmp" "$ZP_STATE_FILE"
+}
+
+write_systemd_units() {
+  local tunnel_id
+  tunnel_id=$(state_get '.tunnel_id')
+  cat >"$ZP_SYSTEMD_DIR/$XRAY_SERVICE" <<EOF
+[Unit]
+Description=ZenProxy Xray service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=zenproxy-xray
+Group=zenproxy-xray
+ExecStartPre=$XRAY_BIN run -test -config $ZP_CONFIG_DIR/xray.json
+ExecStart=$XRAY_BIN run -config $ZP_CONFIG_DIR/xray.json
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat >"$ZP_SYSTEMD_DIR/$CLOUDFLARED_SERVICE" <<EOF
+[Unit]
+Description=ZenProxy Cloudflare Tunnel service
+Wants=network-online.target
+After=network-online.target $XRAY_SERVICE
+
+[Service]
+Type=simple
+User=zenproxy-cloudflared
+Group=zenproxy-cloudflared
+ExecStart=$CLOUDFLARED_BIN --no-autoupdate --config $ZP_CONFIG_DIR/cloudflared.yml tunnel run $tunnel_id
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  chmod 0644 "$ZP_SYSTEMD_DIR/$XRAY_SERVICE" "$ZP_SYSTEMD_DIR/$CLOUDFLARED_SERVICE"
+  systemctl daemon-reload
+}
+
+deploy_manager_command() {
+  local requested_source=$1 source_path temporary
+  source_path=$(readlink -f "$requested_source")
+  [[ -f "$source_path" ]] || return 1
+  temporary=$(mktemp /usr/local/sbin/.zenproxy.XXXXXX) || return 1
+  if ! install -m 0755 "$source_path" "$temporary" || \
+     ! mv -f "$temporary" /usr/local/sbin/zenproxy || \
+     ! ln -sfn /usr/local/sbin/zenproxy /usr/local/sbin/zp; then
+    rm -f "$temporary"
+    return 1
+  fi
+}
+
+install_manager_command() {
+  local replace=${1:-false} requested_source=${2:-${BASH_SOURCE[0]}}
+  [[ -f "$(readlink -f "$requested_source")" ]] || \
+    die "无法定位当前 ZenProxy 脚本，请先下载到本地文件再安装。"
+  if [[ "$replace" != true ]]; then
+    [[ ! -e /usr/local/sbin/zenproxy && ! -L /usr/local/sbin/zenproxy ]] || \
+      die "拒绝覆盖已有命令：/usr/local/sbin/zenproxy"
+    [[ ! -e /usr/local/sbin/zp && ! -L /usr/local/sbin/zp ]] || \
+      die "拒绝覆盖已有命令：/usr/local/sbin/zp"
+  fi
+  deploy_manager_command "$requested_source" || die "无法安装ZenProxy管理命令。"
+  MANAGER_COMMAND_INSTALLED=1
+}
+
+show_install_plan() {
+  local tunnel_domain=$1 reality_sni=$2 vless_port=$3 hy2_port=$4 force_domain=${5:-0}
+  local requested_ipv4=${6:-} requested_ipv6=${7:-}
+  cat <<EOF
+
+安装计划
+  直连IPv4：       ${requested_ipv4:-自动检测}
+  直连IPv6：       ${requested_ipv6:-自动检测}
+  Tunnel域名：     $tunnel_domain
+  HY2证书：        本机自签 + 指纹固定
+  REALITY目标：    $reality_sni:443
+  VLESS监听：       TCP $vless_port
+  Hysteria2监听：   UDP $hy2_port
+  Cloudflare回源：  127.0.0.1:17122
+  Cloudflare授权：  浏览器授权（无需Token）
+EOF
+  (( force_domain == 0 )) || log "注意：本次安装允许覆盖该域名已有的DNS记录。"
+  if [[ "$vless_port" != 80 && "$vless_port" != 443 ]]; then
+    log "TCP 80/443不会被ZenProxy占用，可用于Nginx或Caddy。"
+  fi
+  if [[ "$hy2_port" == 443 ]]; then
+    log "注意：UDP 443用于HY2，不能同时用于Nginx/Caddy HTTP/3。"
+  fi
+}
+
+cmd_install() {
+  local tunnel_domain="" reality_sni="apple.com" direct_address direct_ipv4 direct_ipv6
+  local requested_ipv4="" requested_ipv6=""
+  local vless_port=8443 hy2_port=443
+  local tunnel_name tunnel_id="" arg force_domain=0
+
+  while (($#)); do
+    arg=$1
+    case "$arg" in
+      --tunnel-domain|--reality-sni|--vless-port|--hy2-port|--direct-ipv4|--direct-ipv6)
+        (($# >= 2)) || die "$arg 缺少参数。"
+        case "$arg" in
+          --tunnel-domain) tunnel_domain=$2 ;;
+          --reality-sni) reality_sni=$2 ;;
+          --vless-port) vless_port=$2 ;;
+          --hy2-port) hy2_port=$2 ;;
+          --direct-ipv4) requested_ipv4=$2 ;;
+          --direct-ipv6) requested_ipv6=$2 ;;
+        esac
+        shift 2
+        ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --yes) ASSUME_YES=1; shift ;;
+      --force-domain) force_domain=1; shift ;;
+      *) die "未知安装选项：$arg" ;;
+    esac
+  done
+
+  tunnel_domain=${tunnel_domain:-$(prompt_value "Cloudflare Tunnel子域名（例如 cf.example.com）")}
+  tunnel_domain=$(trim "${tunnel_domain,,}")
+  reality_sni=$(trim "${reality_sni,,}")
+  requested_ipv4=$(trim "$requested_ipv4")
+  requested_ipv6=$(trim "$requested_ipv6")
+  validate_domain "$tunnel_domain" || die "Tunnel域名格式不正确。"
+  validate_domain "$reality_sni" || die "REALITY目标域名格式不正确。"
+  validate_port "$vless_port" || die "VLESS端口无效。"
+  validate_port "$hy2_port" || die "HY2端口无效。"
+  [[ -z "$requested_ipv4" ]] || valid_ipv4_address "$requested_ipv4" || die "手动指定的IPv4地址无效。"
+  [[ -z "$requested_ipv6" ]] || valid_ipv6_address "$requested_ipv6" || die "手动指定的IPv6地址无效。"
+
+  show_install_plan "$tunnel_domain" "$reality_sni" "$vless_port" "$hy2_port" "$force_domain" \
+    "$requested_ipv4" "$requested_ipv6"
+  if (( DRY_RUN )); then
+    info "预演结束，没有修改系统。"
+    return 0
+  fi
+
+  require_root
+  acquire_lock
+  check_platform
+  is_installed && die "ZenProxy已经安装。"
+  check_install_targets
+  confirm "确认开始安装吗？" || { cancelled; return 0; }
+  INSTALL_ACTIVE=1
+
+  install_dependencies
+  check_port_conflicts "$vless_port" "$hy2_port"
+  direct_ipv4=${requested_ipv4:-$(public_ipv4 || true)}
+  direct_ipv6=${requested_ipv6:-$(public_ipv6 || true)}
+  [[ -n "$direct_ipv4" || -n "$direct_ipv6" ]] || die "无法检测本机公网 IP。"
+  direct_address=${direct_ipv4:-$direct_ipv6}
+
+  create_system_user zenproxy-xray
+  create_system_user zenproxy-cloudflared
+  prepare_directories
+  install_core_binaries
+  generate_credentials
+  generate_self_signed_certificate
+
+  tunnel_name="zenproxy-$(hostname -s | tr -cd '[:alnum:]-' | cut -c1-32)-$(openssl rand -hex 4)"
+  write_state "$direct_address" "$direct_ipv4" "$direct_ipv6" "$tunnel_domain" "$reality_sni" \
+    "pending" "$tunnel_name" "$vless_port" "$hy2_port"
+
+  setup_cloudflare_tunnel "$tunnel_domain" "$tunnel_name" tunnel_id "$force_domain"
+  [[ "$tunnel_id" =~ ^[0-9a-fA-F-]{36}$ ]] || die "Tunnel ID未正确写入安装状态。"
+  write_state "$direct_address" "$direct_ipv4" "$direct_ipv6" "$tunnel_domain" "$reality_sni" \
+    "$tunnel_id" "$tunnel_name" "$vless_port" "$hy2_port"
+
+  write_xray_config "$reality_sni" "$vless_port" "$hy2_port"
+  write_cloudflared_config "$tunnel_id" "$tunnel_domain"
+  "$CLOUDFLARED_BIN" --config "$ZP_CONFIG_DIR/cloudflared.yml" tunnel ingress validate
+  MANAGER_COMMAND_INSTALLED=1
+  install_manager_command false "${BASH_SOURCE[0]}"
+  UNITS_INSTALLED=1
+  write_systemd_units
+
+  systemctl enable --now "$XRAY_SERVICE" "$CLOUDFLARED_SERVICE"
+  sleep 3
+  service_active "$XRAY_SERVICE" || die "Xray启动失败，请查看日志。"
+  port_in_use udp "$hy2_port" || die "Xray已启动，但Hysteria2 UDP端口未监听。"
+  service_active "$CLOUDFLARED_SERVICE" || die "cloudflared启动失败，请查看日志。"
+
+  rm -rf -- "$ZP_STATE_DIR/cloudflare-home"
+  CREATED_TUNNEL_HOME=""
+  INSTALL_ACTIVE=0
+  ok "ZenProxy安装完成。"
+  cmd_status
+  log
+  info "下一步：确认安全组放行 TCP $vless_port 和 UDP $hy2_port。"
+  info "运行 sudo zp check 验证三条线路，运行 sudo zp info --clash 获取Mihomo节点。"
+}
+
+all_services() {
+  printf '%s\n' "$XRAY_SERVICE" "$CLOUDFLARED_SERVICE"
+}
+
+component_service() {
+  case "$1" in
+    all) printf 'all' ;;
+    xray|vless|hy2|hysteria) printf '%s' "$XRAY_SERVICE" ;;
+    cloudflared|cloudflare|tunnel) printf '%s' "$CLOUDFLARED_SERVICE" ;;
+    *) die "未知组件：$1" ;;
+  esac
+}
+
+cmd_service_action() {
+  local action=$1 component=all service arg component_set=0
+  shift
+  while (($#)); do
+    arg=$1
+    case "$arg" in
+      --dry-run) DRY_RUN=1 ;;
+      -*) die "未知服务选项：$arg" ;;
+      *) (( component_set == 0 )) || die "只能指定一个服务组件。"; component=$arg; component_set=1 ;;
+    esac
+    shift
+  done
+  require_root
+  require_installed
+  acquire_lock
+  service=$(component_service "$component")
+  if [[ "$service" == all ]]; then
+    mapfile -t services < <(all_services)
+    run systemctl "$action" "${services[@]}"
+  else
+    run systemctl "$action" "$service"
+  fi
+  ok "服务操作完成：$action $component"
+}
+
+route_status_line() {
+  local label=$1 service=$2 protocol=$3 port=$4
+  if service_active "$service" && port_in_use "$protocol" "$port"; then
+    printf '%-22s %s正常%s\n' "$label" "$C_GREEN" "$C_RESET"
+  else
+    printf '%-22s %s异常%s\n' "$label" "$C_RED" "$C_RESET"
+  fi
+}
+
+cloudflare_route_reachable() {
+  local domain=$1 ws_path=$2 code
+  code=$(curl --http1.1 -sS --connect-timeout 5 --max-time 5 -o /dev/null -w '%{http_code}' \
+    -H 'Connection: Upgrade' \
+    -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' \
+    -H 'Sec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2RlZg==' \
+    "https://$domain$ws_path" 2>/dev/null || true)
+  [[ "$code" == 101 ]]
+}
+
+random_check_port() {
+  local candidate
+  for candidate in $(shuf -i 20000-45000 -n 32); do
+    if ! port_in_use tcp "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+local_proxy_protocol_test() {
+  local config_file=$1 client_port=$2 client_pid result=1 attempt
+  "$XRAY_BIN" run -config "$config_file" >/dev/null 2>&1 &
+  client_pid=$!
+  for attempt in {1..20}; do
+    if port_in_use tcp "$client_port"; then
+      break
+    fi
+    sleep 0.1
+  done
+  if port_in_use tcp "$client_port" && \
+     curl --noproxy '*' --proxy "socks5h://127.0.0.1:$client_port" \
+       --connect-timeout 3 --max-time 8 -sS -o /dev/null \
+       "http://127.0.0.1:17122/"; then
+    result=0
+  fi
+  kill "$client_pid" >/dev/null 2>&1 || true
+  wait "$client_pid" >/dev/null 2>&1 || true
+  return "$result"
+}
+
+reality_protocol_reachable() {
+  local vless_port=$1 client_port config_file uuid public_key short_id reality_sni result
+  client_port=$(random_check_port) || return 1
+  config_file=$(mktemp "$ZP_STATE_DIR/.check-reality.XXXXXX.json") || return 1
+  uuid=$(read_secret "vless.uuid")
+  public_key=$(read_secret "reality.public-key")
+  short_id=$(read_secret "reality.short-id")
+  reality_sni=$(state_get '.reality_sni')
+  jq -n --arg uuid "$uuid" --arg public_key "$public_key" --arg short_id "$short_id" \
+    --arg sni "$reality_sni" --argjson server_port "$vless_port" --argjson client_port "$client_port" \
+    '{log:{loglevel:"error"},inbounds:[{listen:"127.0.0.1",port:$client_port,protocol:"socks",settings:{auth:"noauth",udp:false}}],outbounds:[{protocol:"vless",settings:{vnext:[{address:"127.0.0.1",port:$server_port,users:[{id:$uuid,encryption:"none",flow:"xtls-rprx-vision"}]}]},streamSettings:{network:"raw",security:"reality",realitySettings:{serverName:$sni,fingerprint:"chrome",publicKey:$public_key,shortId:$short_id}}}]}' >"$config_file"
+  chmod 0600 "$config_file"
+  if local_proxy_protocol_test "$config_file" "$client_port"; then
+    result=0
+  else
+    result=$?
+  fi
+  rm -f -- "$config_file"
+  return "$result"
+}
+
+hy2_protocol_reachable() {
+  local hy2_port=$1 client_port config_file password fingerprint result
+  client_port=$(random_check_port) || return 1
+  config_file=$(mktemp "$ZP_STATE_DIR/.check-hy2.XXXXXX.json") || return 1
+  password=$(read_secret "hysteria.password")
+  fingerprint=$(read_secret "tls.fingerprint")
+  jq -n --arg password "$password" --arg fingerprint "$fingerprint" \
+    --argjson server_port "$hy2_port" --argjson client_port "$client_port" \
+    '{log:{loglevel:"error"},inbounds:[{listen:"127.0.0.1",port:$client_port,protocol:"socks",settings:{auth:"noauth",udp:false}}],outbounds:[{protocol:"hysteria",settings:{version:2,address:"127.0.0.1",port:$server_port},streamSettings:{network:"hysteria",security:"tls",tlsSettings:{serverName:"www.bing.com",pinnedPeerCertSha256:$fingerprint},hysteriaSettings:{version:2,auth:$password}}}]}' >"$config_file"
+  chmod 0600 "$config_file"
+  if local_proxy_protocol_test "$config_file" "$client_port"; then
+    result=0
+  else
+    result=$?
+  fi
+  rm -f -- "$config_file"
+  return "$result"
+}
+
+cmd_status() {
+  require_installed
+  local direct_ipv4 direct_ipv6 tunnel_domain vless_port hy2_port
+  direct_ipv4=$(stored_direct_ipv4)
+  direct_ipv6=$(stored_direct_ipv6)
+  tunnel_domain=$(state_get '.tunnel_domain')
+  vless_port=$(state_get '.vless_port')
+  hy2_port=$(state_get '.hy2_port')
+  show_banner
+  if service_active "$CLOUDFLARED_SERVICE" && port_in_use tcp 17122; then
+    printf '%-22s %s本机正常%s\n' "Cloudflare本地组件" "$C_GREEN" "$C_RESET"
+  else
+    printf '%-22s %s本机异常%s\n' "Cloudflare本地组件" "$C_RED" "$C_RESET"
+  fi
+  route_status_line "HY2本机监听" "$XRAY_SERVICE" udp "$hy2_port"
+  route_status_line "REALITY本机监听" "$XRAY_SERVICE" tcp "$vless_port"
+  printf '%-22s UDP %s\n' "HY2端口" "$hy2_port"
+  printf '%-22s TCP %s\n' "VLESS端口" "$vless_port"
+  [[ -z "$direct_ipv4" ]] || printf '%-22s %s\n' "直连IPv4" "$direct_ipv4"
+  [[ -z "$direct_ipv6" ]] || printf '%-22s %s\n' "直连IPv6" "$direct_ipv6"
+  printf '%-22s %s\n' "Tunnel域名" "$tunnel_domain"
+  printf '%-22s %s\n' "HY2证书" "自签证书（指纹固定）"
+  info "公网线路请运行：sudo zp check"
+}
+
+build_node_links() {
+  local direct_ipv4 direct_ipv6 direct_host tunnel_domain reality_sni vless_port hy2_port
+  local hy2_password vless_uuid public_key short_id ws_path encoded_path fingerprint
+  direct_ipv4=$(stored_direct_ipv4)
+  direct_ipv6=$(stored_direct_ipv6)
+  tunnel_domain=$(state_get '.tunnel_domain')
+  reality_sni=$(state_get '.reality_sni')
+  vless_port=$(state_get '.vless_port')
+  hy2_port=$(state_get '.hy2_port')
+  hy2_password=$(read_secret "hysteria.password")
+  vless_uuid=$(read_secret "vless.uuid")
+  public_key=$(read_secret "reality.public-key")
+  short_id=$(read_secret "reality.short-id")
+  ws_path=$(read_secret "ws.path")
+  fingerprint=$(read_secret "tls.fingerprint")
+  encoded_path=${ws_path/\//%2F}
+
+  CF_LINK="vless://${vless_uuid}@${tunnel_domain}:443?encryption=none&security=tls&sni=${tunnel_domain}&fp=chrome&type=ws&host=${tunnel_domain}&path=${encoded_path}#cloudflare-primary"
+  HY2_V4_LINK="" VLESS_V4_LINK="" HY2_V6_LINK="" VLESS_V6_LINK=""
+  if [[ -n "$direct_ipv4" ]]; then
+    direct_host=$(uri_host "$direct_ipv4")
+    HY2_V4_LINK="hysteria2://${hy2_password}@${direct_host}:${hy2_port}/?sni=${HY2_CERT_NAME}&alpn=h3&pinSHA256=${fingerprint}#hy2-direct-ipv4"
+    VLESS_V4_LINK="vless://${vless_uuid}@${direct_host}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#vless-reality-ipv4"
+  fi
+  if [[ -n "$direct_ipv6" ]]; then
+    direct_host=$(uri_host "$direct_ipv6")
+    HY2_V6_LINK="hysteria2://${hy2_password}@${direct_host}:${hy2_port}/?sni=${HY2_CERT_NAME}&alpn=h3&pinSHA256=${fingerprint}#hy2-direct-ipv6"
+    VLESS_V6_LINK="vless://${vless_uuid}@${direct_host}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#vless-reality-ipv6"
+  fi
+}
+
+print_qr() {
+  local label=$1 link=$2
+  command_exists qrencode || return 0
+  printf '\n%s\n' "$label"
+  qrencode -t ANSIUTF8 "$link"
+}
+
+cmd_info() {
+  require_root
+  require_installed
+  local arg hy2_password vless_uuid output_format="links"
+  while (($#)); do
+    arg=$1
+    case "$arg" in
+      --show-secrets) SHOW_SECRETS=1 ;;
+      --clash|--mihomo) output_format="clash" ;;
+      *) die "未知info选项：$arg" ;;
+    esac
+    shift
+  done
+  if [[ "$output_format" == clash ]]; then
+    write_mihomo_nodes /dev/stdout
+    return 0
+  fi
+  build_node_links
+  hy2_password=$(read_secret "hysteria.password")
+  vless_uuid=$(read_secret "vless.uuid")
+  show_banner
+  printf '%-22s %s\n' "HY2密码" "$(mask_secret "$hy2_password")"
+  printf '%-22s %s\n' "VLESS UUID" "$(mask_secret "$vless_uuid")"
+  if (( ! SHOW_SECRETS )); then
+    info "完整链接已隐藏。使用 sudo zp info --show-secrets 查看。"
+    return 0
+  fi
+  printf '\n[Cloudflare主线路]\n%s\n' "$CF_LINK"
+  [[ -z "$HY2_V4_LINK" ]] || printf '\n[HY2直连 IPv4]\n%s\n' "$HY2_V4_LINK"
+  [[ -z "$VLESS_V4_LINK" ]] || printf '\n[VLESS REALITY直连 IPv4]\n%s\n' "$VLESS_V4_LINK"
+  [[ -z "$HY2_V6_LINK" ]] || printf '\n[HY2直连 IPv6]\n%s\n' "$HY2_V6_LINK"
+  [[ -z "$VLESS_V6_LINK" ]] || printf '\n[VLESS REALITY直连 IPv6]\n%s\n' "$VLESS_V6_LINK"
+  if [[ -t 1 ]]; then
+    print_qr "Cloudflare主线路二维码" "$CF_LINK"
+    [[ -z "$HY2_V4_LINK" ]] || print_qr "HY2直连 IPv4二维码" "$HY2_V4_LINK"
+    [[ -z "$VLESS_V4_LINK" ]] || print_qr "VLESS REALITY直连 IPv4二维码" "$VLESS_V4_LINK"
+    [[ -z "$HY2_V6_LINK" ]] || print_qr "HY2直连 IPv6二维码" "$HY2_V6_LINK"
+    [[ -z "$VLESS_V6_LINK" ]] || print_qr "VLESS REALITY直连 IPv6二维码" "$VLESS_V6_LINK"
+  fi
+}
+
+append_mihomo_direct_nodes() {
+  local output=$1 address=$2 suffix=$3 reality_sni vless_port hy2_port
+  local hy2_password uuid public_key short_id tls_fingerprint
+  reality_sni=$(state_get '.reality_sni'); vless_port=$(state_get '.vless_port'); hy2_port=$(state_get '.hy2_port')
+  hy2_password=$(read_secret "hysteria.password"); uuid=$(read_secret "vless.uuid")
+  public_key=$(read_secret "reality.public-key"); short_id=$(read_secret "reality.short-id")
+  tls_fingerprint=$(openssl x509 -in "$ZP_TLS_DIR/fullchain.pem" -noout -fingerprint -sha256 | cut -d= -f2)
+  cat >>"$output" <<EOF
+  - name: hy2-direct-$suffix
+    type: hysteria2
+    server: "$address"
+    port: $hy2_port
+    password: $hy2_password
+    sni: $HY2_CERT_NAME
+    skip-cert-verify: false
+    fingerprint: $tls_fingerprint
+  - name: vless-reality-$suffix
+    type: vless
+    server: "$address"
+    port: $vless_port
+    uuid: $uuid
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: $reality_sni
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: $public_key
+      short-id: $short_id
+EOF
+}
+
+write_mihomo_nodes() {
+  local output=$1 direct_ipv4 direct_ipv6 tunnel_domain ws_path uuid
+  direct_ipv4=$(stored_direct_ipv4); direct_ipv6=$(stored_direct_ipv6)
+  tunnel_domain=$(state_get '.tunnel_domain'); ws_path=$(read_secret "ws.path"); uuid=$(read_secret "vless.uuid")
+  cat >"$output" <<EOF
+proxies:
+  - name: cloudflare-primary
+    type: vless
+    server: $tunnel_domain
+    port: 443
+    uuid: $uuid
+    network: ws
+    tls: true
+    udp: true
+    servername: $tunnel_domain
+    client-fingerprint: chrome
+    ws-opts:
+      path: $ws_path
+      headers:
+        Host: $tunnel_domain
+EOF
+  [[ -z "$direct_ipv4" ]] || append_mihomo_direct_nodes "$output" "$direct_ipv4" ipv4
+  [[ -z "$direct_ipv6" ]] || append_mihomo_direct_nodes "$output" "$direct_ipv6" ipv6
+}
+
+write_mihomo_export() {
+  local output=$1 direct_ipv4 direct_ipv6
+  direct_ipv4=$(stored_direct_ipv4); direct_ipv6=$(stored_direct_ipv6)
+  write_mihomo_nodes "$output"
+  cat >>"$output" <<'EOF'
+proxy-groups:
+  - name: ZenProxy
+    type: select
+    proxies:
+      - cloudflare-primary
+EOF
+  if [[ -n "$direct_ipv4" ]]; then
+    printf '      - hy2-direct-ipv4\n      - vless-reality-ipv4\n' >>"$output"
+  fi
+  if [[ -n "$direct_ipv6" ]]; then
+    printf '      - hy2-direct-ipv6\n      - vless-reality-ipv6\n' >>"$output"
+  fi
+  cat >>"$output" <<'EOF'
+rules:
+  - MATCH,ZenProxy
+EOF
+}
+
+write_singbox_export() {
+  local output=$1 direct_ipv4 direct_ipv6 tunnel_domain reality_sni vless_port hy2_port
+  local hy2_password uuid public_key short_id ws_path
+  direct_ipv4=$(stored_direct_ipv4); direct_ipv6=$(stored_direct_ipv6); tunnel_domain=$(state_get '.tunnel_domain')
+  reality_sni=$(state_get '.reality_sni'); vless_port=$(state_get '.vless_port'); hy2_port=$(state_get '.hy2_port')
+  hy2_password=$(read_secret "hysteria.password"); uuid=$(read_secret "vless.uuid")
+  public_key=$(read_secret "reality.public-key"); short_id=$(read_secret "reality.short-id"); ws_path=$(read_secret "ws.path")
+  jq -n --arg direct_ipv4 "$direct_ipv4" --arg direct_ipv6 "$direct_ipv6" \
+    --arg tunnel "$tunnel_domain" --arg sni "$reality_sni" \
+    --arg hy2_sni "$HY2_CERT_NAME" \
+    --arg password "$hy2_password" --arg uuid "$uuid" --arg public_key "$public_key" \
+    --arg short_id "$short_id" --arg ws_path "$ws_path" --rawfile hy2_certificate "$ZP_TLS_DIR/fullchain.pem" \
+    --argjson vp "$vless_port" --argjson hp "$hy2_port" \
+    'def direct_nodes($server;$suffix): [
+       {type:"hysteria2",tag:("hy2-direct-" + $suffix),server:$server,server_port:$hp,password:$password,
+        tls:{enabled:true,server_name:$hy2_sni,
+          certificate:($hy2_certificate | split("\n") | map(select(length > 0)))}},
+       {type:"vless",tag:("vless-reality-" + $suffix),server:$server,server_port:$vp,uuid:$uuid,flow:"xtls-rprx-vision",
+        tls:{enabled:true,server_name:$sni,utls:{enabled:true,fingerprint:"chrome"},reality:{enabled:true,public_key:$public_key,short_id:$short_id}}}
+     ];
+     {outbounds: ([
+       {type:"vless",tag:"cloudflare-primary",server:$tunnel,server_port:443,uuid:$uuid,
+        transport:{type:"ws",path:$ws_path,headers:{Host:$tunnel}},tls:{enabled:true,server_name:$tunnel}}
+     ] + (if $direct_ipv4 == "" then [] else direct_nodes($direct_ipv4;"ipv4") end)
+       + (if $direct_ipv6 == "" then [] else direct_nodes($direct_ipv6;"ipv6") end))}' >"$output"
+}
+
+cmd_export() {
+  require_root
+  require_installed
+  local output="" arg parent base
+  while (($#)); do
+    arg=$1
+    case "$arg" in
+      --output)
+        (($# >= 2)) || die "--output 缺少目录参数。"
+        output=$2
+        shift 2
+        ;;
+      *) die "未知export选项：$arg" ;;
+    esac
+  done
+  output=${output:-"$PWD/zenproxy-client-$(date +%Y%m%d-%H%M%S)"}
+  parent=$(dirname -- "$output")
+  base=$(basename -- "$output")
+  [[ "$base" != . && "$base" != .. && -n "$base" ]] || die "导出目录无效。"
+  [[ -d "$parent" ]] || die "导出目录的上级目录不存在：$parent"
+  [[ ! -e "$output" && ! -L "$output" ]] || die "导出目录已经存在，请指定一个新目录：$output"
+  mkdir -m 0700 -- "$output"
+  build_node_links
+  {
+    printf '%s\n' "$CF_LINK"
+    [[ -z "$HY2_V4_LINK" ]] || printf '%s\n%s\n' "$HY2_V4_LINK" "$VLESS_V4_LINK"
+    [[ -z "$HY2_V6_LINK" ]] || printf '%s\n%s\n' "$HY2_V6_LINK" "$VLESS_V6_LINK"
+  } >"$output/nodes.txt"
+  write_mihomo_export "$output/mihomo.yaml"
+  write_singbox_export "$output/sing-box-outbounds.json"
+  chmod 0600 "$output/nodes.txt" "$output/mihomo.yaml" "$output/sing-box-outbounds.json"
+  ok "客户端配置已导出到：$output"
+}
+
+check_command() {
+  local success=$1 failure=$2
+  shift 2
+  if "$@"; then
+    ok "$success"
+  else
+    warn "$failure"
+    CHECK_FAILURES=$((CHECK_FAILURES + 1))
+  fi
+}
+
+cmd_check() {
+  require_root
+  require_installed
+  local direct_ipv4 direct_ipv6 tunnel_domain vless_port hy2_port current_ipv4 current_ipv6 ws_path
+  CHECK_FAILURES=0
+  direct_ipv4=$(stored_direct_ipv4); direct_ipv6=$(stored_direct_ipv6); tunnel_domain=$(state_get '.tunnel_domain')
+  vless_port=$(state_get '.vless_port'); hy2_port=$(state_get '.hy2_port'); ws_path=$(read_secret "ws.path")
+  show_banner
+  check_command "Xray配置有效" "Xray配置无效" bash -c '"$1" run -test -config "$2" >/dev/null 2>&1' _ "$XRAY_BIN" "$ZP_CONFIG_DIR/xray.json"
+  check_command "Xray服务正常" "Xray服务异常" service_active "$XRAY_SERVICE"
+  check_command "Cloudflare Tunnel正常" "Cloudflare Tunnel异常" service_active "$CLOUDFLARED_SERVICE"
+  check_command "Cloudflare公网主线路可达" "Cloudflare公网主线路无法完成WebSocket握手" \
+    cloudflare_route_reachable "$tunnel_domain" "$ws_path"
+  check_command "TCP $vless_port 正在监听" "TCP $vless_port 未监听" port_in_use tcp "$vless_port"
+  check_command "UDP $hy2_port 正在监听" "UDP $hy2_port 未监听" port_in_use udp "$hy2_port"
+  check_command "回环服务端口17122正在监听" "回环服务端口17122未监听" port_in_use tcp 17122
+  check_command "REALITY协议握手正常" "REALITY协议握手失败，请运行 zp logs xray 查看详情" \
+    reality_protocol_reachable "$vless_port"
+  check_command "HY2协议握手正常" "HY2协议握手失败，请运行 zp logs xray 查看详情" \
+    hy2_protocol_reachable "$hy2_port"
+  check_command "HY2自签证书有效" "HY2自签证书无效" \
+    openssl x509 -checkend $((30 * 86400)) -noout -in "$ZP_TLS_DIR/fullchain.pem"
+  current_ipv4=$(public_ipv4 || true); current_ipv6=$(public_ipv6 || true)
+  if [[ -n "$direct_ipv4" ]]; then
+    if [[ -z "$current_ipv4" ]]; then
+      warn "公网IPv4检测失败，无法判断地址是否变化"
+      CHECK_FAILURES=$((CHECK_FAILURES + 1))
+    elif [[ "$current_ipv4" == "$direct_ipv4" ]]; then
+      ok "公网IPv4未变化"
+    else
+      warn "公网IPv4已变化，请重新安装以更新节点"
+      CHECK_FAILURES=$((CHECK_FAILURES + 1))
+    fi
+  fi
+  if [[ -n "$direct_ipv6" ]]; then
+    if [[ -z "$current_ipv6" ]]; then
+      warn "公网IPv6检测失败，无法判断地址是否变化"
+      CHECK_FAILURES=$((CHECK_FAILURES + 1))
+    elif [[ "$current_ipv6" == "$direct_ipv6" ]]; then
+      ok "公网IPv6未变化"
+    else
+      warn "公网IPv6已变化，请重新安装以更新节点"
+      CHECK_FAILURES=$((CHECK_FAILURES + 1))
+    fi
+  fi
+  info "云厂商安全组无法从本机完整验证，请确认放行 TCP $vless_port 和 UDP $hy2_port。"
+  if (( CHECK_FAILURES == 0 )); then ok "全部检查通过。"; else die "发现 $CHECK_FAILURES 项异常。"; fi
+}
+
+cmd_logs() {
+  require_installed
+  local component=${1:-all} service
+  service=$(component_service "$component")
+  if [[ "$service" == all ]]; then
+    journalctl -u "$XRAY_SERVICE" -u "$CLOUDFLARED_SERVICE" -n 100 --no-pager
+  else
+    journalctl -u "$service" -n 100 --no-pager
+  fi
+}
+
+replace_binary_atomic() {
+  local source=$1 target=$2 temporary
+  temporary=$(mktemp "$(dirname "$target")/.zenproxy-binary.XXXXXX") || return 1
+  if ! install -m 0755 "$source" "$temporary" || ! mv -f "$temporary" "$target"; then
+    rm -f "$temporary"
+    return 1
+  fi
+}
+
+update_state_manager_version() {
+  local version=$1
+  jq --arg version "$version" '.manager_version=$version' "$ZP_STATE_FILE" >"$ZP_STATE_FILE.tmp" && \
+    chmod 0600 "$ZP_STATE_FILE.tmp" && mv "$ZP_STATE_FILE.tmp" "$ZP_STATE_FILE"
+}
+
+cmd_update() {
+  require_root
+  require_installed
+  local rollback_dir staging_dir manager_file="" manager_sha256="" manager_version="" arg update_ok=0
+  local current_xray current_cloudflared
+  local target_xray_version=$XRAY_VERSION target_cloudflared_version=$CLOUDFLARED_VERSION metadata
+  while (($#)); do
+    arg=$1
+    case "$arg" in
+      --manager-file)
+        (($# >= 2)) || die "--manager-file 缺少文件路径。"
+        manager_file=$2; shift 2 ;;
+      --manager-sha256)
+        (($# >= 2)) || die "--manager-sha256 缺少摘要。"
+        manager_sha256=${2,,}; shift 2 ;;
+      --yes) ASSUME_YES=1; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      *) die "未知update选项：$arg" ;;
+    esac
+  done
+  if [[ -n "$manager_file" || -n "$manager_sha256" ]]; then
+    [[ -n "$manager_file" && "$manager_sha256" =~ ^[0-9a-f]{64}$ ]] || \
+      die "更新管理器必须同时提供 --manager-file 和64位 --manager-sha256。"
+    manager_file=$(readlink -f "$manager_file")
+    [[ -f "$manager_file" ]] || die "管理器更新文件不存在。"
+    [[ "$(sha256sum "$manager_file" | awk '{print $1}')" == "$manager_sha256" ]] || die "管理器更新文件摘要不匹配。"
+    bash -n "$manager_file" || die "新管理器脚本语法无效。"
+    manager_version=$(bash "$manager_file" version 2>/dev/null | awk '/^ZenProxy / {print $2; exit}')
+    [[ -n "$manager_version" ]] || die "无法识别新管理器版本。"
+    metadata=$(bash -c '
+      source "$1"
+      jq -n --arg xray "$XRAY_VERSION" --arg cloudflared "$CLOUDFLARED_VERSION" \
+        "{xray:\$xray,cloudflared:\$cloudflared}"
+    ' _ "$manager_file")
+    target_xray_version=$(jq -er '.xray' <<<"$metadata") || die "无法读取新管理器的Xray版本。"
+    target_cloudflared_version=$(jq -er '.cloudflared' <<<"$metadata") || die "无法读取新管理器的cloudflared版本。"
+  fi
+  current_xray=$($XRAY_BIN version 2>/dev/null | awk '/^Xray / {print $2; exit}' || true)
+  current_cloudflared=$($CLOUDFLARED_BIN --version 2>/dev/null | awk '/cloudflared version/ {print $3; exit}' || true)
+  log "更新计划：Xray ${current_xray:-未知} -> ${target_xray_version#v}；cloudflared ${current_cloudflared:-未知} -> ${target_cloudflared_version#v}。"
+  [[ -z "$manager_file" ]] || log "同时更新ZenProxy管理器到 $manager_version。"
+  if [[ "${current_xray#v}" == "${target_xray_version#v}" && \
+        "${current_cloudflared#v}" == "${target_cloudflared_version#v}" && \
+        -z "$manager_file" ]]; then
+    ok "核心程序已经是目标版本，无需下载或重启。"
+    return 0
+  fi
+  if (( DRY_RUN )); then
+    log "将事务更新 Xray ${target_xray_version#v} 和 cloudflared ${target_cloudflared_version#v}。"
+    [[ -n "$manager_file" ]] && log "同时更新 ZenProxy 管理器到 $manager_version。"
+    return 0
+  fi
+  if [[ -t 0 ]] && ! confirm "确认下载并重启相关服务吗？"; then
+    cancelled
+    return 0
+  fi
+  acquire_lock
+  rollback_dir=$(mktemp -d "$ZP_STATE_DIR/.update-rollback.XXXXXX")
+  staging_dir=$(mktemp -d "$ZP_STATE_DIR/.update-staging.XXXXXX")
+  cp -a "$ZP_BIN_DIR/." "$rollback_dir/"
+  [[ -z "$manager_file" ]] || cp -a /usr/local/sbin/zenproxy "$rollback_dir/zenproxy-manager"
+  info "下载并预检ZenProxy固定核心版本。"
+  if ! (install_core_binaries "$staging_dir" "$target_xray_version" "$target_cloudflared_version"); then
+    rm -rf -- "$rollback_dir" "$staging_dir"
+    die "核心程序下载或校验失败，尚未替换任何文件。"
+  fi
+  if ! "$staging_dir/xray" run -test -config "$ZP_CONFIG_DIR/xray.json" || \
+     ! "$staging_dir/cloudflared" --config "$ZP_CONFIG_DIR/cloudflared.yml" tunnel ingress validate >/dev/null; then
+    rm -rf -- "$rollback_dir" "$staging_dir"
+    die "新核心无法通过当前配置检查，尚未替换任何文件。"
+  fi
+
+  if replace_binary_atomic "$staging_dir/xray" "$XRAY_BIN" && \
+     replace_binary_atomic "$staging_dir/cloudflared" "$CLOUDFLARED_BIN" && \
+     { [[ -z "$manager_file" ]] || deploy_manager_command "$manager_file"; } && \
+     systemctl restart "$XRAY_SERVICE" "$CLOUDFLARED_SERVICE"; then
+    sleep 3
+    if service_active "$XRAY_SERVICE" && service_active "$CLOUDFLARED_SERVICE"; then
+      if [[ -z "$manager_version" ]] || update_state_manager_version "$manager_version"; then
+        update_ok=1
+      fi
+    fi
+  fi
+
+  if (( ! update_ok )); then
+    warn "更新提交或健康检查失败，正在回滚全部组件。"
+    replace_binary_atomic "$rollback_dir/xray" "$XRAY_BIN" || true
+    replace_binary_atomic "$rollback_dir/cloudflared" "$CLOUDFLARED_BIN" || true
+    [[ ! -s "$rollback_dir/zenproxy-manager" ]] || deploy_manager_command "$rollback_dir/zenproxy-manager" || true
+    systemctl restart "$XRAY_SERVICE" "$CLOUDFLARED_SERVICE" || true
+    rm -rf -- "$rollback_dir" "$staging_dir"
+    die "更新失败，已尝试恢复更新前版本。"
+  fi
+  rm -rf -- "$rollback_dir" "$staging_dir"
+  ok "核心程序更新完成。"
+  [[ -z "$manager_version" ]] || ok "ZenProxy管理器已更新到 $manager_version。"
+}
+
+safe_remove_tree() {
+  local target=$1
+  case "$target" in
+    /etc/zenproxy|/var/lib/zenproxy|/usr/local/lib/zenproxy) rm -rf -- "$target" ;;
+    *) die "拒绝删除非ZenProxy目录：$target" ;;
+  esac
+}
+
+cmd_uninstall() {
+  require_root
+  require_installed
+  acquire_lock
+  local delete_tunnel=0 tunnel_id tunnel_name cf_home="" arg user
+  local -a managed_users=()
+  while (($#)); do
+    arg=$1
+    case "$arg" in
+      --delete-tunnel) delete_tunnel=1 ;;
+      --yes) ASSUME_YES=1 ;;
+      --dry-run) DRY_RUN=1 ;;
+      *) die "未知卸载选项：$arg" ;;
+    esac
+    shift
+  done
+  if (( DRY_RUN )); then
+    log "将停止并删除ZenProxy的2个服务、配置、状态、二进制和专用用户。"
+    (( delete_tunnel )) && log "同时删除Cloudflare Tunnel；DNS记录可能仍需在控制台处理。"
+    return 0
+  fi
+  if (( ! delete_tunnel && ! ASSUME_YES )) && [[ -t 0 ]]; then
+    if confirm "是否同时删除Cloudflare Tunnel？这需要再次进行浏览器授权。"; then
+      delete_tunnel=1
+    fi
+  fi
+  if (( delete_tunnel )); then
+    warn "本次将删除本机配置、节点密钥和Cloudflare Tunnel。"
+  else
+    info "本次只删除本机内容，Cloudflare Tunnel和DNS记录将保留。"
+  fi
+  confirm "确认卸载ZenProxy吗？" || { cancelled; return 0; }
+  tunnel_id=$(state_get '.tunnel_id')
+  tunnel_name=$(state_get '.tunnel_name')
+  mapfile -t managed_users < <(jq -r '.managed_users[]?' "$ZP_STATE_FILE")
+  systemctl disable --now "$XRAY_SERVICE" "$CLOUDFLARED_SERVICE" 2>/dev/null || true
+  rm -f "$ZP_SYSTEMD_DIR/$XRAY_SERVICE" "$ZP_SYSTEMD_DIR/$CLOUDFLARED_SERVICE"
+  systemctl daemon-reload
+
+  if (( delete_tunnel )); then
+    cf_home=$(mktemp -d "$ZP_STATE_DIR/.cloudflare-delete.XXXXXX")
+    install -d -m 0700 "$cf_home/.cloudflared"
+    info "删除远程Tunnel需要临时进行一次Cloudflare浏览器授权。"
+    if HOME="$cf_home" "$CLOUDFLARED_BIN" tunnel login && \
+       HOME="$cf_home" "$CLOUDFLARED_BIN" tunnel delete -f "$tunnel_id"; then
+      ok "Cloudflare Tunnel已删除。"
+    else
+      warn "Tunnel删除失败，请在Cloudflare控制台处理。"
+    fi
+    rm -rf -- "$cf_home"
+    warn "DNS记录可能仍需在Cloudflare控制台删除。"
+  else
+    warn "Cloudflare Tunnel和DNS记录未删除。使用 --delete-tunnel 可同时删除Tunnel。"
+  fi
+
+  safe_remove_tree "$ZP_CONFIG_DIR"
+  safe_remove_tree "$ZP_STATE_DIR"
+  safe_remove_tree "$ZP_INSTALL_DIR"
+  for user in "${managed_users[@]}"; do
+    case "$user" in
+      zenproxy-xray|zenproxy-cloudflared) userdel "$user" 2>/dev/null || true ;;
+      *) warn "忽略状态文件中的未知用户：$user" ;;
+    esac
+  done
+  rm -f /usr/local/sbin/zp /usr/local/sbin/zenproxy
+  ok "ZenProxy已从本机卸载。"
+}
+
+menu_pause() {
+  read -r -p "按回车返回主菜单..." _
+}
+
+interactive_menu() {
+  local choice
+  while true; do
+    clear 2>/dev/null || true
+    show_banner
+    if is_installed; then
+      cat <<'EOF'
+1. 查看运行状态
+2. 显示节点二维码
+3. 一键检测
+4. 导出客户端配置
+5. 重启全部服务
+6. 查看最近日志
+7. 更新核心程序（会重启服务）
+8. 卸载本机ZenProxy
+0. 退出
+EOF
+    else
+      cat <<'EOF'
+1. 安装ZenProxy
+0. 退出
+EOF
+    fi
+    read -r -p "请选择: " choice
+    if ! is_installed; then
+      case "$choice" in
+        1) cmd_install ;;
+        0) return ;;
+        *) warn "无效选项"; sleep 1 ;;
+      esac
+      continue
+    fi
+    case "$choice" in
+      1) cmd_status; menu_pause ;;
+      2) cmd_info --show-secrets; menu_pause ;;
+      3) cmd_check || true; menu_pause ;;
+      4) cmd_export; menu_pause ;;
+      5) cmd_service_action restart all; menu_pause ;;
+      6) cmd_logs all; menu_pause ;;
+      7) cmd_update; menu_pause ;;
+      8) cmd_uninstall; return ;;
+      0) return ;;
+      *) warn "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+main() {
+  local command=${1:-}
+  if [[ -z "$command" ]]; then
+    require_root
+    interactive_menu
+    return
+  fi
+  shift || true
+  case "$command" in
+    install) cmd_install "$@" ;;
+    status) cmd_status "$@" ;;
+    check) cmd_check "$@" ;;
+    info) cmd_info "$@" ;;
+    export) cmd_export "$@" ;;
+    start|stop|restart) cmd_service_action "$command" "$@" ;;
+    logs) cmd_logs "${1:-all}" ;;
+    update) cmd_update "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    version|--version|-v) log "ZenProxy $ZP_VERSION" ;;
+    help|--help|-h) usage ;;
+    *) usage; die "未知命令：$command" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
