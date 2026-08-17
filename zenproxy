@@ -113,7 +113,7 @@ validate_domain() {
 
 validate_node_name() {
   local name=$1
-  [[ "$name" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]]
+  [[ "$name" =~ ^[[:alnum:]_-]{1,32}$ ]]
 }
 
 node_proxy_name() {
@@ -220,7 +220,7 @@ usage() {
   --show-secrets        显示完整节点链接
   --clash               info输出Mihomo/Clash.Meta节点YAML
   --tunnel-domain NAME  Cloudflare Tunnel域名
-  --node-name NAME      客户端节点名称（必须唯一）
+  --node-name NAME      客户端节点名称（支持中英文，必须唯一）
   --vless-port PORT     VLESS TCP端口，默认8443
   --hy2-port PORT       HY2 UDP端口，默认443
   --direct-ipv4 ADDR    手动指定直连IPv4地址
@@ -503,6 +503,12 @@ uri_host() {
   else
     printf '%s' "$address"
   fi
+}
+
+uri_fragment_name() {
+  local name
+  name=$(node_proxy_name "$@")
+  jq -nr --arg value "$name" '$value | @uri'
 }
 
 check_port_conflicts() {
@@ -837,7 +843,7 @@ cmd_install() {
   requested_ipv4=$(trim "$requested_ipv4")
   requested_ipv6=$(trim "$requested_ipv6")
   validate_domain "$tunnel_domain" || die "Tunnel域名格式不正确。"
-  validate_node_name "$node_name" || die "节点名称无效，只允许小写字母、数字、短横线和下划线，长度为1到32个字符。"
+  validate_node_name "$node_name" || die "节点名称无效，只允许中英文、数字、短横线和下划线，长度为1到32个字符。"
   validate_domain "$reality_sni" || die "REALITY目标域名格式不正确。"
   validate_port "$vless_port" || die "VLESS端口无效。"
   validate_port "$hy2_port" || die "HY2端口无效。"
@@ -1082,17 +1088,17 @@ build_node_links() {
   encoded_path=${ws_path/\//%2F}
   [[ -n "$(state_get '.node_name')" ]] || die "安装状态缺少节点名称，请重新安装。"
 
-  CF_LINK="vless://${vless_uuid}@${tunnel_domain}:443?encryption=none&security=tls&sni=${tunnel_domain}&fp=chrome&type=ws&host=${tunnel_domain}&path=${encoded_path}#$(node_proxy_name cf)"
+  CF_LINK="vless://${vless_uuid}@${tunnel_domain}:443?encryption=none&security=tls&sni=${tunnel_domain}&fp=chrome&type=ws&host=${tunnel_domain}&path=${encoded_path}#$(uri_fragment_name cf)"
   HY2_V4_LINK="" VLESS_V4_LINK="" HY2_V6_LINK="" VLESS_V6_LINK=""
   if [[ -n "$direct_ipv4" ]]; then
     direct_host=$(uri_host "$direct_ipv4")
-    HY2_V4_LINK="hysteria2://${hy2_password}@${direct_host}:${hy2_port}/?sni=${HY2_CERT_NAME}&alpn=h3&pinSHA256=${fingerprint}#$(node_proxy_name hy2 v4)"
-    VLESS_V4_LINK="vless://${vless_uuid}@${direct_host}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#$(node_proxy_name reality v4)"
+    HY2_V4_LINK="hysteria2://${hy2_password}@${direct_host}:${hy2_port}/?sni=${HY2_CERT_NAME}&alpn=h3&pinSHA256=${fingerprint}#$(uri_fragment_name hy2 v4)"
+    VLESS_V4_LINK="vless://${vless_uuid}@${direct_host}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#$(uri_fragment_name reality v4)"
   fi
   if [[ -n "$direct_ipv6" ]]; then
     direct_host=$(uri_host "$direct_ipv6")
-    HY2_V6_LINK="hysteria2://${hy2_password}@${direct_host}:${hy2_port}/?sni=${HY2_CERT_NAME}&alpn=h3&pinSHA256=${fingerprint}#$(node_proxy_name hy2 v6)"
-    VLESS_V6_LINK="vless://${vless_uuid}@${direct_host}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#$(node_proxy_name reality v6)"
+    HY2_V6_LINK="hysteria2://${hy2_password}@${direct_host}:${hy2_port}/?sni=${HY2_CERT_NAME}&alpn=h3&pinSHA256=${fingerprint}#$(uri_fragment_name hy2 v6)"
+    VLESS_V6_LINK="vless://${vless_uuid}@${direct_host}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#$(uri_fragment_name reality v6)"
   fi
 }
 
@@ -1152,7 +1158,7 @@ append_mihomo_direct_nodes() {
   public_key=$(read_secret "reality.public-key"); short_id=$(read_secret "reality.short-id")
   tls_fingerprint=$(openssl x509 -in "$ZP_TLS_DIR/fullchain.pem" -noout -fingerprint -sha256 | cut -d= -f2)
   cat >>"$output" <<EOF
-  - name: $(node_proxy_name hy2 "$suffix")
+  - name: "$(node_proxy_name hy2 "$suffix")"
     type: hysteria2
     server: "$address"
     port: $hy2_port
@@ -1160,7 +1166,7 @@ append_mihomo_direct_nodes() {
     sni: $HY2_CERT_NAME
     skip-cert-verify: false
     fingerprint: $tls_fingerprint
-  - name: $(node_proxy_name reality "$suffix")
+  - name: "$(node_proxy_name reality "$suffix")"
     type: vless
     server: "$address"
     port: $vless_port
@@ -1184,7 +1190,7 @@ write_mihomo_nodes() {
   [[ -n "$(state_get '.node_name')" ]] || die "安装状态缺少节点名称，请重新安装。"
   cat >"$output" <<EOF
 proxies:
-  - name: $(node_proxy_name cf)
+  - name: "$(node_proxy_name cf)"
     type: vless
     server: $tunnel_domain
     port: 443

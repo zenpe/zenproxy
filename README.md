@@ -42,7 +42,7 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/zenpe/zenproxy/main/ins
   install --tunnel-domain cf.example.com --node-name us-la-01
 ```
 
-不带 `install` 参数会进入中文菜单。交互安装会要求输入唯一的节点名称；脚本化安装必须通过 `--node-name` 指定。节点名称只允许小写字母、数字、短横线和下划线，长度为 1 到 32 个字符。安装完成后，客户端节点会按 `<节点名称>-cf`、`<节点名称>-hy2-v4`、`<节点名称>-reality-v4` 等格式生成。多台 VPS 合并配置时，请为每台机器使用不同的节点名称。安装时会打开 Cloudflare 浏览器授权，不需要预先创建 DNS 记录或提供 Tunnel Token。
+不带 `install` 参数会进入中文菜单。交互安装会要求输入唯一的节点名称；脚本化安装必须通过 `--node-name` 指定。节点名称支持中英文、数字、短横线和下划线，长度为 1 到 32 个字符；分享链接中的名称会自动进行 URI 编码。安装完成后，客户端节点会按 `<节点名称>-cf`、`<节点名称>-hy2-v4`、`<节点名称>-reality-v4` 等格式生成。多台 VPS 合并配置时，请为每台机器使用不同的节点名称。安装时会打开 Cloudflare 浏览器授权，不需要预先创建 DNS 记录或提供 Tunnel Token。
 
 需要固定历史版本时，可将地址中的 `main` 替换为对应的 Git tag，例如 `v0.4.2`。
 

@@ -30,6 +30,7 @@ assert_not_contains() {
 
 assert "accepts a normal domain" validate_domain direct.example.com
 assert "accepts a valid node name" validate_node_name us-la-01
+assert "accepts a Chinese node name" validate_node_name '美国-洛杉矶-01'
 if validate_node_name 'US Los Angeles'; then
   printf 'FAIL: rejects an invalid node name\n' >&2
   exit 1
@@ -174,8 +175,16 @@ build_node_links
 [[ "$HY2_V6_LINK" == *'@[2001:db8::10]:443/'* ]]
 [[ "$VLESS_V6_LINK" == *'@[2001:db8::10]:8443?'* ]]
 [[ "$CF_LINK" == vless://*test-node-cf ]]
+[[ "$CF_LINK" == *'#test-node-cf' ]]
 printf 'PASS: generated links honor configured ports\n'
 [[ $(uri_host '2001:db8::1') == '[2001:db8::1]' ]]
+write_state 203.0.113.10 203.0.113.10 2001:db8::10 cf.example.com apple.com \
+  11111111-1111-4111-8111-111111111111 zenproxy-test 8443 443 '美国-洛杉矶-01'
+build_node_links
+[[ "$CF_LINK" == *'%E7%BE%8E%E5%9B%BD-%E6%B4%9B%E6%9D%89%E7%9F%B6-01-cf' ]]
+printf 'PASS: Chinese node names are URI encoded\n'
+write_state 203.0.113.10 203.0.113.10 2001:db8::10 cf.example.com apple.com \
+  11111111-1111-4111-8111-111111111111 zenproxy-test 8443 443 test-node
 printf 'PASS: IPv6 node addresses use URI brackets\n'
 
 clash_nodes=$(cmd_info --clash)
