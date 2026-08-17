@@ -111,6 +111,23 @@ validate_domain() {
   [[ "$domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]
 }
 
+validate_node_name() {
+  local name=$1
+  [[ "$name" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]]
+}
+
+node_proxy_name() {
+  local node_name protocol family
+  node_name=$(state_get '.node_name')
+  protocol=$1
+  family=${2:-}
+  if [[ -n "$family" ]]; then
+    printf '%s-%s-%s' "$node_name" "$protocol" "$family"
+  else
+    printf '%s-%s' "$node_name" "$protocol"
+  fi
+}
+
 validate_port() {
   local port=$1
   [[ "$port" =~ ^[1-9][0-9]*$ && ${#port} -le 5 ]] && (( 10#$port <= 65535 ))
@@ -203,6 +220,7 @@ usage() {
   --show-secrets        显示完整节点链接
   --clash               info输出Mihomo/Clash.Meta节点YAML
   --tunnel-domain NAME  Cloudflare Tunnel域名
+  --node-name NAME      客户端节点名称（必须唯一）
   --vless-port PORT     VLESS TCP端口，默认8443
   --hy2-port PORT       HY2 UDP端口，默认443
   --direct-ipv4 ADDR    手动指定直连IPv4地址
@@ -628,9 +646,9 @@ EOF
 }
 
 write_state() {
-  local direct_address=$1 direct_ipv4=$2 direct_ipv6=$3 tunnel_domain=$4 reality_sni=$5 tunnel_id=$6 tunnel_name=$7 vless_port=$8 hy2_port=$9
+  local direct_address=$1 direct_ipv4=$2 direct_ipv6=$3 tunnel_domain=$4 reality_sni=$5 tunnel_id=$6 tunnel_name=$7 vless_port=$8 hy2_port=$9 node_name=${10:-}
   jq -n \
-    --arg schema "2" \
+    --arg schema "3" \
     --arg version "$ZP_VERSION" \
     --arg direct_address "$direct_address" \
     --arg direct_ipv4 "$direct_ipv4" \
@@ -639,10 +657,11 @@ write_state() {
     --arg reality_sni "$reality_sni" \
     --arg tunnel_id "$tunnel_id" \
     --arg tunnel_name "$tunnel_name" \
+    --arg node_name "$node_name" \
     --argjson vless_port "$vless_port" \
     --argjson hy2_port "$hy2_port" \
     --arg installed_at "$(date --iso-8601=seconds)" \
-    '{schema:($schema|tonumber),manager_version:$version,direct_address:$direct_address,
+    '{schema:($schema|tonumber),manager_version:$version,node_name:$node_name,direct_address:$direct_address,
       direct_ipv4:$direct_ipv4,direct_ipv6:$direct_ipv6,
       tunnel_domain:$tunnel_domain,reality_sni:$reality_sni,
       tunnel_id:$tunnel_id,tunnel_name:$tunnel_name,
@@ -751,13 +770,17 @@ install_manager_command() {
 
 show_install_plan() {
   local tunnel_domain=$1 reality_sni=$2 vless_port=$3 hy2_port=$4 force_domain=${5:-0}
-  local requested_ipv4=${6:-} requested_ipv6=${7:-}
+  local requested_ipv4=${6:-} requested_ipv6=${7:-} node_name=${8:-}
   cat <<EOF
 
 安装计划
   直连IPv4：       ${requested_ipv4:-自动检测}
   直连IPv6：       ${requested_ipv6:-自动检测}
   Tunnel域名：     $tunnel_domain
+  节点名称：       $node_name
+  Cloudflare节点： ${node_name}-cf
+  HY2节点：        ${node_name}-hy2-v4/v6
+  REALITY节点：     ${node_name}-reality-v4/v6
   HY2证书：        本机自签 + 指纹固定
   REALITY目标：    $reality_sni:443
   VLESS监听：       TCP $vless_port
@@ -776,6 +799,7 @@ EOF
 
 cmd_install() {
   local tunnel_domain="" reality_sni="apple.com" direct_address direct_ipv4 direct_ipv6
+  local node_name=""
   local requested_ipv4="" requested_ipv6=""
   local vless_port=8443 hy2_port=443
   local tunnel_name tunnel_id="" arg force_domain=0
@@ -783,10 +807,11 @@ cmd_install() {
   while (($#)); do
     arg=$1
     case "$arg" in
-      --tunnel-domain|--reality-sni|--vless-port|--hy2-port|--direct-ipv4|--direct-ipv6)
+      --tunnel-domain|--node-name|--reality-sni|--vless-port|--hy2-port|--direct-ipv4|--direct-ipv6)
         (($# >= 2)) || die "$arg 缺少参数。"
         case "$arg" in
           --tunnel-domain) tunnel_domain=$2 ;;
+          --node-name) node_name=$2 ;;
           --reality-sni) reality_sni=$2 ;;
           --vless-port) vless_port=$2 ;;
           --hy2-port) hy2_port=$2 ;;
@@ -803,11 +828,16 @@ cmd_install() {
   done
 
   tunnel_domain=${tunnel_domain:-$(prompt_value "Cloudflare Tunnel子域名（例如 cf.example.com）")}
+  if [[ -z "$node_name" ]]; then
+    [[ -t 0 ]] || die "非交互安装必须指定 --node-name。"
+    node_name=$(prompt_value "节点名称（例如 us-la-01）")
+  fi
   tunnel_domain=$(trim "${tunnel_domain,,}")
   reality_sni=$(trim "${reality_sni,,}")
   requested_ipv4=$(trim "$requested_ipv4")
   requested_ipv6=$(trim "$requested_ipv6")
   validate_domain "$tunnel_domain" || die "Tunnel域名格式不正确。"
+  validate_node_name "$node_name" || die "节点名称无效，只允许小写字母、数字、短横线和下划线，长度为1到32个字符。"
   validate_domain "$reality_sni" || die "REALITY目标域名格式不正确。"
   validate_port "$vless_port" || die "VLESS端口无效。"
   validate_port "$hy2_port" || die "HY2端口无效。"
@@ -815,7 +845,7 @@ cmd_install() {
   [[ -z "$requested_ipv6" ]] || valid_ipv6_address "$requested_ipv6" || die "手动指定的IPv6地址无效。"
 
   show_install_plan "$tunnel_domain" "$reality_sni" "$vless_port" "$hy2_port" "$force_domain" \
-    "$requested_ipv4" "$requested_ipv6"
+    "$requested_ipv4" "$requested_ipv6" "$node_name"
   if (( DRY_RUN )); then
     info "预演结束，没有修改系统。"
     return 0
@@ -845,12 +875,12 @@ cmd_install() {
 
   tunnel_name="zenproxy-$(hostname -s | tr -cd '[:alnum:]-' | cut -c1-32)-$(openssl rand -hex 4)"
   write_state "$direct_address" "$direct_ipv4" "$direct_ipv6" "$tunnel_domain" "$reality_sni" \
-    "pending" "$tunnel_name" "$vless_port" "$hy2_port"
+    "pending" "$tunnel_name" "$vless_port" "$hy2_port" "$node_name"
 
   setup_cloudflare_tunnel "$tunnel_domain" "$tunnel_name" tunnel_id "$force_domain"
   [[ "$tunnel_id" =~ ^[0-9a-fA-F-]{36}$ ]] || die "Tunnel ID未正确写入安装状态。"
   write_state "$direct_address" "$direct_ipv4" "$direct_ipv6" "$tunnel_domain" "$reality_sni" \
-    "$tunnel_id" "$tunnel_name" "$vless_port" "$hy2_port"
+    "$tunnel_id" "$tunnel_name" "$vless_port" "$hy2_port" "$node_name"
 
   write_xray_config "$reality_sni" "$vless_port" "$hy2_port"
   write_cloudflared_config "$tunnel_id" "$tunnel_domain"
@@ -1008,12 +1038,14 @@ hy2_protocol_reachable() {
 
 cmd_status() {
   require_installed
-  local direct_ipv4 direct_ipv6 tunnel_domain vless_port hy2_port
+  local direct_ipv4 direct_ipv6 tunnel_domain vless_port hy2_port node_name
   direct_ipv4=$(stored_direct_ipv4)
   direct_ipv6=$(stored_direct_ipv6)
   tunnel_domain=$(state_get '.tunnel_domain')
   vless_port=$(state_get '.vless_port')
   hy2_port=$(state_get '.hy2_port')
+  node_name=$(state_get '.node_name')
+  [[ -n "$node_name" ]] || die "安装状态缺少节点名称，请重新安装。"
   show_banner
   if service_active "$CLOUDFLARED_SERVICE" && port_in_use tcp 17122; then
     printf '%-22s %s本机正常%s\n' "Cloudflare本地组件" "$C_GREEN" "$C_RESET"
@@ -1027,6 +1059,7 @@ cmd_status() {
   [[ -z "$direct_ipv4" ]] || printf '%-22s %s\n' "直连IPv4" "$direct_ipv4"
   [[ -z "$direct_ipv6" ]] || printf '%-22s %s\n' "直连IPv6" "$direct_ipv6"
   printf '%-22s %s\n' "Tunnel域名" "$tunnel_domain"
+  printf '%-22s %s\n' "节点名称" "$node_name"
   printf '%-22s %s\n' "HY2证书" "自签证书（指纹固定）"
   info "公网线路请运行：sudo zp check"
 }
@@ -1047,18 +1080,19 @@ build_node_links() {
   ws_path=$(read_secret "ws.path")
   fingerprint=$(read_secret "tls.fingerprint")
   encoded_path=${ws_path/\//%2F}
+  [[ -n "$(state_get '.node_name')" ]] || die "安装状态缺少节点名称，请重新安装。"
 
-  CF_LINK="vless://${vless_uuid}@${tunnel_domain}:443?encryption=none&security=tls&sni=${tunnel_domain}&fp=chrome&type=ws&host=${tunnel_domain}&path=${encoded_path}#cloudflare-primary"
+  CF_LINK="vless://${vless_uuid}@${tunnel_domain}:443?encryption=none&security=tls&sni=${tunnel_domain}&fp=chrome&type=ws&host=${tunnel_domain}&path=${encoded_path}#$(node_proxy_name cf)"
   HY2_V4_LINK="" VLESS_V4_LINK="" HY2_V6_LINK="" VLESS_V6_LINK=""
   if [[ -n "$direct_ipv4" ]]; then
     direct_host=$(uri_host "$direct_ipv4")
-    HY2_V4_LINK="hysteria2://${hy2_password}@${direct_host}:${hy2_port}/?sni=${HY2_CERT_NAME}&alpn=h3&pinSHA256=${fingerprint}#hy2-direct-ipv4"
-    VLESS_V4_LINK="vless://${vless_uuid}@${direct_host}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#vless-reality-ipv4"
+    HY2_V4_LINK="hysteria2://${hy2_password}@${direct_host}:${hy2_port}/?sni=${HY2_CERT_NAME}&alpn=h3&pinSHA256=${fingerprint}#$(node_proxy_name hy2 v4)"
+    VLESS_V4_LINK="vless://${vless_uuid}@${direct_host}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#$(node_proxy_name reality v4)"
   fi
   if [[ -n "$direct_ipv6" ]]; then
     direct_host=$(uri_host "$direct_ipv6")
-    HY2_V6_LINK="hysteria2://${hy2_password}@${direct_host}:${hy2_port}/?sni=${HY2_CERT_NAME}&alpn=h3&pinSHA256=${fingerprint}#hy2-direct-ipv6"
-    VLESS_V6_LINK="vless://${vless_uuid}@${direct_host}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#vless-reality-ipv6"
+    HY2_V6_LINK="hysteria2://${hy2_password}@${direct_host}:${hy2_port}/?sni=${HY2_CERT_NAME}&alpn=h3&pinSHA256=${fingerprint}#$(node_proxy_name hy2 v6)"
+    VLESS_V6_LINK="vless://${vless_uuid}@${direct_host}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reality_sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#$(node_proxy_name reality v6)"
   fi
 }
 
@@ -1118,7 +1152,7 @@ append_mihomo_direct_nodes() {
   public_key=$(read_secret "reality.public-key"); short_id=$(read_secret "reality.short-id")
   tls_fingerprint=$(openssl x509 -in "$ZP_TLS_DIR/fullchain.pem" -noout -fingerprint -sha256 | cut -d= -f2)
   cat >>"$output" <<EOF
-  - name: hy2-direct-$suffix
+  - name: $(node_proxy_name hy2 "$suffix")
     type: hysteria2
     server: "$address"
     port: $hy2_port
@@ -1126,7 +1160,7 @@ append_mihomo_direct_nodes() {
     sni: $HY2_CERT_NAME
     skip-cert-verify: false
     fingerprint: $tls_fingerprint
-  - name: vless-reality-$suffix
+  - name: $(node_proxy_name reality "$suffix")
     type: vless
     server: "$address"
     port: $vless_port
@@ -1147,9 +1181,10 @@ write_mihomo_nodes() {
   local output=$1 direct_ipv4 direct_ipv6 tunnel_domain ws_path uuid
   direct_ipv4=$(stored_direct_ipv4); direct_ipv6=$(stored_direct_ipv6)
   tunnel_domain=$(state_get '.tunnel_domain'); ws_path=$(read_secret "ws.path"); uuid=$(read_secret "vless.uuid")
+  [[ -n "$(state_get '.node_name')" ]] || die "安装状态缺少节点名称，请重新安装。"
   cat >"$output" <<EOF
 proxies:
-  - name: cloudflare-primary
+  - name: $(node_proxy_name cf)
     type: vless
     server: $tunnel_domain
     port: 443
@@ -1164,58 +1199,99 @@ proxies:
       headers:
         Host: $tunnel_domain
 EOF
-  [[ -z "$direct_ipv4" ]] || append_mihomo_direct_nodes "$output" "$direct_ipv4" ipv4
-  [[ -z "$direct_ipv6" ]] || append_mihomo_direct_nodes "$output" "$direct_ipv6" ipv6
+  [[ -z "$direct_ipv4" ]] || append_mihomo_direct_nodes "$output" "$direct_ipv4" v4
+  [[ -z "$direct_ipv6" ]] || append_mihomo_direct_nodes "$output" "$direct_ipv6" v6
 }
 
 write_mihomo_export() {
-  local output=$1 direct_ipv4 direct_ipv6
+  local output=$1 direct_ipv4 direct_ipv6 nodes_file
   direct_ipv4=$(stored_direct_ipv4); direct_ipv6=$(stored_direct_ipv6)
-  write_mihomo_nodes "$output"
+  nodes_file=$(mktemp "$ZP_STATE_DIR/.mihomo-nodes.XXXXXX")
+  write_mihomo_nodes "$nodes_file"
+  cat >"$output" <<'EOF'
+dns:
+  enable: true
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+    - 114.114.114.114
+  use-hosts: true
+  nameserver:
+    - https://sm2.doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+  fallback:
+    - 8.8.4.4
+    - 208.67.220.220
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
+      - 127.0.0.1/32
+      - 0.0.0.0/32
+    domain:
+      - '+.google.com'
+      - '+.facebook.com'
+      - '+.youtube.com'
+port: 7890
+socks-port: 7891
+allow-lan: false
+mode: rule
+log-level: info
+external-controller: 127.0.0.1:9090
+
+EOF
+  cat "$nodes_file" >>"$output"
+  rm -f -- "$nodes_file"
   cat >>"$output" <<'EOF'
 proxy-groups:
   - name: ZenProxy
     type: select
     proxies:
-      - cloudflare-primary
 EOF
+  printf '      - %s\n' "$(node_proxy_name cf)" >>"$output"
   if [[ -n "$direct_ipv4" ]]; then
-    printf '      - hy2-direct-ipv4\n      - vless-reality-ipv4\n' >>"$output"
+    printf '      - %s\n      - %s\n' "$(node_proxy_name hy2 v4)" "$(node_proxy_name reality v4)" >>"$output"
   fi
   if [[ -n "$direct_ipv6" ]]; then
-    printf '      - hy2-direct-ipv6\n      - vless-reality-ipv6\n' >>"$output"
+    printf '      - %s\n      - %s\n' "$(node_proxy_name hy2 v6)" "$(node_proxy_name reality v6)" >>"$output"
   fi
   cat >>"$output" <<'EOF'
 rules:
+  - GEOSITE,category-ads-all,REJECT
+  - GEOSITE,cn,DIRECT
+  - GEOIP,cn,DIRECT
   - MATCH,ZenProxy
 EOF
 }
 
 write_singbox_export() {
   local output=$1 direct_ipv4 direct_ipv6 tunnel_domain reality_sni vless_port hy2_port
-  local hy2_password uuid public_key short_id ws_path
+  local hy2_password uuid public_key short_id ws_path node_name
   direct_ipv4=$(stored_direct_ipv4); direct_ipv6=$(stored_direct_ipv6); tunnel_domain=$(state_get '.tunnel_domain')
   reality_sni=$(state_get '.reality_sni'); vless_port=$(state_get '.vless_port'); hy2_port=$(state_get '.hy2_port')
   hy2_password=$(read_secret "hysteria.password"); uuid=$(read_secret "vless.uuid")
   public_key=$(read_secret "reality.public-key"); short_id=$(read_secret "reality.short-id"); ws_path=$(read_secret "ws.path")
+  node_name=$(state_get '.node_name')
   jq -n --arg direct_ipv4 "$direct_ipv4" --arg direct_ipv6 "$direct_ipv6" \
+    --arg node_name "$node_name" \
     --arg tunnel "$tunnel_domain" --arg sni "$reality_sni" \
     --arg hy2_sni "$HY2_CERT_NAME" \
     --arg password "$hy2_password" --arg uuid "$uuid" --arg public_key "$public_key" \
     --arg short_id "$short_id" --arg ws_path "$ws_path" --rawfile hy2_certificate "$ZP_TLS_DIR/fullchain.pem" \
     --argjson vp "$vless_port" --argjson hp "$hy2_port" \
     'def direct_nodes($server;$suffix): [
-       {type:"hysteria2",tag:("hy2-direct-" + $suffix),server:$server,server_port:$hp,password:$password,
+       {type:"hysteria2",tag:(($node_name + "-hy2-" + $suffix)),server:$server,server_port:$hp,password:$password,
         tls:{enabled:true,server_name:$hy2_sni,
           certificate:($hy2_certificate | split("\n") | map(select(length > 0)))}},
-       {type:"vless",tag:("vless-reality-" + $suffix),server:$server,server_port:$vp,uuid:$uuid,flow:"xtls-rprx-vision",
+       {type:"vless",tag:(($node_name + "-reality-" + $suffix)),server:$server,server_port:$vp,uuid:$uuid,flow:"xtls-rprx-vision",
         tls:{enabled:true,server_name:$sni,utls:{enabled:true,fingerprint:"chrome"},reality:{enabled:true,public_key:$public_key,short_id:$short_id}}}
      ];
      {outbounds: ([
-       {type:"vless",tag:"cloudflare-primary",server:$tunnel,server_port:443,uuid:$uuid,
+       {type:"vless",tag:($node_name + "-cf"),server:$tunnel,server_port:443,uuid:$uuid,
         transport:{type:"ws",path:$ws_path,headers:{Host:$tunnel}},tls:{enabled:true,server_name:$tunnel}}
-     ] + (if $direct_ipv4 == "" then [] else direct_nodes($direct_ipv4;"ipv4") end)
-       + (if $direct_ipv6 == "" then [] else direct_nodes($direct_ipv6;"ipv6") end))}' >"$output"
+     ] + (if $direct_ipv4 == "" then [] else direct_nodes($direct_ipv4;"v4") end)
+       + (if $direct_ipv6 == "" then [] else direct_nodes($direct_ipv6;"v6") end))}' >"$output"
 }
 
 cmd_export() {

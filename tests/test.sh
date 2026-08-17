@@ -29,6 +29,13 @@ assert_not_contains() {
 }
 
 assert "accepts a normal domain" validate_domain direct.example.com
+assert "accepts a valid node name" validate_node_name us-la-01
+if validate_node_name 'US Los Angeles'; then
+  printf 'FAIL: rejects an invalid node name\n' >&2
+  exit 1
+else
+  printf 'PASS: rejects an invalid node name\n'
+fi
 if validate_domain https://example.com; then
   printf 'FAIL: rejects a URL as domain\n' >&2
   exit 1
@@ -88,6 +95,7 @@ unset -f ss
 dry_run_output=$(
   "$PROJECT_DIR/zenproxy" install \
     --tunnel-domain cf.example.com \
+    --node-name test-node \
     --dry-run
 )
 assert_not_contains "dry-run reserves web TCP 443" "$dry_run_output" "VLESS监听：       TCP 443"
@@ -144,7 +152,7 @@ openssl x509 -in "$ZP_TLS_DIR/fullchain.pem" -outform DER | sha256sum | awk '{pr
   >"$ZP_CREDENTIAL_DIR/tls.fingerprint"
 
 write_state 203.0.113.10 203.0.113.10 2001:db8::10 cf.example.com apple.com \
-  11111111-1111-4111-8111-111111111111 zenproxy-test 8443 443
+  11111111-1111-4111-8111-111111111111 zenproxy-test 8443 443 test-node
 [[ $(jq -r '.managed_users | length' "$ZP_STATE_FILE") == 2 ]]
 manager_hash=$(sha256sum "$PROJECT_DIR/zenproxy" | awk '{print $1}')
 manager_update_plan=$(cmd_update --manager-file "$PROJECT_DIR/zenproxy" \
@@ -165,7 +173,7 @@ build_node_links
 [[ "$VLESS_V4_LINK" == *'203.0.113.10:8443?'* ]]
 [[ "$HY2_V6_LINK" == *'@[2001:db8::10]:443/'* ]]
 [[ "$VLESS_V6_LINK" == *'@[2001:db8::10]:8443?'* ]]
-[[ "$CF_LINK" == vless://*cloudflare-primary ]]
+[[ "$CF_LINK" == vless://*test-node-cf ]]
 printf 'PASS: generated links honor configured ports\n'
 [[ $(uri_host '2001:db8::1') == '[2001:db8::1]' ]]
 printf 'PASS: IPv6 node addresses use URI brackets\n'
@@ -176,6 +184,7 @@ clash_nodes=$(cmd_info --clash)
 assert_not_contains "info clash output omits proxy groups" "$clash_nodes" "proxy-groups:"
 assert_not_contains "Mihomo HY2 keeps certificate verification" "$clash_nodes" "skip-cert-verify: true"
 [[ "$clash_nodes" == *"fingerprint:"* ]]
+[[ "$clash_nodes" == *"test-node-cf"* ]]
 printf 'PASS: info emits separate IPv4 and IPv6 Clash.Meta nodes\n'
 
 existing_export="$TEST_ROOT/existing-export"
@@ -200,9 +209,19 @@ jq -e '.outbounds | length == 5' "$safe_export/sing-box-outbounds.json" >/dev/nu
 jq -e '[.outbounds[] | select(.type == "hysteria2") |
   (.tls.insecure // false) == false and (.tls.certificate | length > 0)] | all' \
   "$safe_export/sing-box-outbounds.json" >/dev/null
+for tag in test-node-cf test-node-hy2-v4 test-node-reality-v4 test-node-hy2-v6 test-node-reality-v6; do
+  jq -e --arg tag "$tag" '[.outbounds[].tag] | index($tag) != null' \
+    "$safe_export/sing-box-outbounds.json" >/dev/null
+done
 assert_not_contains "sing-box HY2 never disables TLS verification" \
   "$(<"$safe_export/sing-box-outbounds.json")" '"insecure":true'
 [[ $(awk '/^proxy-groups:/ {exit} /^  - name:/ {count++} END {print count+0}' "$safe_export/mihomo.yaml") == 5 ]]
+grep -Fq 'name: ZenProxy' "$safe_export/mihomo.yaml"
+grep -Fq 'GEOSITE,category-ads-all,REJECT' "$safe_export/mihomo.yaml"
+grep -Fq 'GEOSITE,cn,DIRECT' "$safe_export/mihomo.yaml"
+grep -Fq 'GEOIP,cn,DIRECT' "$safe_export/mihomo.yaml"
+grep -Fq 'MATCH,ZenProxy' "$safe_export/mihomo.yaml"
+grep -Fq 'https://dns.alidns.com/dns-query' "$safe_export/mihomo.yaml"
 [[ $(jq '.outbounds | length' "$safe_export/sing-box-outbounds.json") == 5 ]]
 printf 'PASS: export creates a dedicated private directory\n'
 
