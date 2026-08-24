@@ -1338,8 +1338,6 @@ cmd_export() {
   [[ -d "$parent" ]] || die "导出目录的上级目录不存在：$parent"
   [[ ! -e "$output" && ! -L "$output" ]] || die "导出目录已经存在，请指定一个新目录：$output"
   mkdir -m 0700 -- "$output"
-  real_user="${SUDO_USER:-$USER}"
-  [[ -n "$real_user" ]] && chown -R "$real_user:" "$output"
   build_node_links
   {
     printf '%s\n' "$CF_LINK"
@@ -1349,6 +1347,8 @@ cmd_export() {
   write_mihomo_export "$output/mihomo.yaml"
   write_singbox_export "$output/sing-box-outbounds.json"
   chmod 0600 "$output/nodes.txt" "$output/mihomo.yaml" "$output/sing-box-outbounds.json"
+  real_user="${SUDO_USER:-$USER}"
+  [[ -n "$real_user" ]] && chown -R "$real_user:" "$output"
   ok "客户端配置已导出到：$output"
 }
 
