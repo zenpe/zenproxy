@@ -754,6 +754,14 @@ EOF
   systemctl daemon-reload
 }
 
+manager_link_ok() {
+  # 已存在的路径若是软链且指向本管理器则放行(重建时会覆盖),
+  # 其它文件/软链一律拒绝,避免误伤同名工具。
+  local target=$1 resolved
+  resolved=$(readlink "$target" 2>/dev/null || true)
+  [[ "$resolved" == /usr/local/sbin/zenproxy || "$resolved" == /usr/local/sbin/zp ]]
+}
+
 deploy_manager_command() {
   local requested_source=$1 source_path temporary
   source_path=$(readlink -f "$requested_source")
@@ -773,12 +781,12 @@ install_manager_command() {
   [[ -f "$(readlink -f "$requested_source")" ]] || \
     die "无法定位当前 ZenProxy 脚本，请先下载到本地文件再安装。"
   if [[ "$replace" != true ]]; then
-    [[ ! -e /usr/local/sbin/zenproxy && ! -L /usr/local/sbin/zenproxy ]] || \
-      die "拒绝覆盖已有命令：/usr/local/sbin/zenproxy"
-    [[ ! -e /usr/local/sbin/zp && ! -L /usr/local/sbin/zp ]] || \
-      die "拒绝覆盖已有命令：/usr/local/sbin/zp"
-    [[ ! -e /usr/local/bin/zp && ! -L /usr/local/bin/zp ]] || \
-      die "拒绝覆盖已有命令：/usr/local/bin/zp"
+    local target
+    for target in /usr/local/sbin/zenproxy /usr/local/sbin/zp /usr/local/bin/zp; do
+      if [[ -e "$target" || -L "$target" ]] && ! manager_link_ok "$target"; then
+        die "拒绝覆盖已有命令：$target"
+      fi
+    done
   fi
   deploy_manager_command "$requested_source" || die "无法安装ZenProxy管理命令。"
   MANAGER_COMMAND_INSTALLED=1
