@@ -35,14 +35,17 @@ chmod +x zenproxy
 sudo ./zenproxy
 ```
 
-远程一键安装（跟随 main 稳定分支）：
+远程一键安装（跟随 main 稳定分支）。脚本需要交互输入时请先下载到本地再运行，避免 `curl | bash`/进程替换占用标准输入：
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/zenpe/zenproxy/main/install.sh) \
-  install --tunnel-domain cf.example.com --node-name us-la-01
+curl -fsSL https://raw.githubusercontent.com/zenpe/zenproxy/main/install.sh -o zp-install.sh
+sudo bash zp-install.sh install \
+  --tunnel-domain cf.example.com \
+  --node-name us-la-01 \
+  --yes
 ```
 
-不带 `install` 参数会进入中文菜单。交互安装会要求输入唯一的节点名称；脚本化安装必须通过 `--node-name` 指定。节点名称支持中英文、数字、短横线和下划线，长度为 1 到 32 个字符；分享链接中的名称会自动进行 URI 编码。安装完成后，客户端节点会按 `<节点名称>-cf`、`<节点名称>-hy2-v4`、`<节点名称>-reality-v4` 等格式生成。多台 VPS 合并配置时，请为每台机器使用不同的节点名称。安装时会打开 Cloudflare 浏览器授权，不需要预先创建 DNS 记录或提供 Tunnel Token。
+不带 `install` 参数会进入中文菜单。交互安装会要求输入唯一的节点名称、Tunnel子域名并二次确认；脚本化安装必须通过 `--tunnel-domain` 和 `--node-name` 显式指定，并用 `--yes` 跳过确认。节点名称支持中英文、数字、短横线和下划线，长度为 1 到 32 个字符；分享链接中的名称会自动进行 URI 编码。安装完成后，客户端节点会按 `<节点名称>-cf`、`<节点名称>-hy2-v4`、`<节点名称>-reality-v4` 等格式生成。多台 VPS 合并配置时，请为每台机器使用不同的节点名称。安装时会打开 Cloudflare 浏览器授权，不需要预先创建 DNS 记录或提供 Tunnel Token。
 
 需要固定历史版本时，可将地址中的 `main` 替换为对应的 Git tag，例如 `v0.4.2`。
 
@@ -75,6 +78,7 @@ sudo zp restart
 sudo zp logs hy2
 sudo zp update
 sudo zp uninstall
+sudo zp sudoer
 ```
 
 `zp status` 展示本地进程和监听状态；`zp check` 会通过公网域名执行 WebSocket 握手，并在本机实际测试 REALITY 和 HY2 协议。云厂商安全组仍需确认放行直连使用的 TCP 和 UDP 端口。
@@ -89,7 +93,9 @@ ZenProxy 不启动公网订阅服务器。
 
 Mihomo配置使用服务端证书指纹固定，sing-box配置内嵌HY2自签证书，不会关闭TLS证书校验。
 
-导出目录必须是一个尚不存在的新目录，ZenProxy 不会覆盖或修改已有目录内容。
+导出目录必须是一个尚不存在的新目录，ZenProxy 不会覆盖或修改已有目录内容。创建后目录会自动改为运行用户的属主（通过 sudo 运行时为用户 `SUDO_USER`），可直接访问；目录内文件权限为 0600。
+
+`sudo zp sudoer` 为当前用户生成一条仅放行 zenproxy 的 NOPASSWD sudo 白名单，之后 `sudo zp` 不再要求密码；用 `sudo zp sudoer --remove` 移除。
 
 ## 文件布局
 
@@ -99,6 +105,7 @@ Mihomo配置使用服务端证书指纹固定，sing-box配置内嵌HY2自签证
 /usr/local/lib/zenproxy/       固定版本核心程序
 /usr/local/sbin/zenproxy       主命令
 /usr/local/sbin/zp             简写命令
+/usr/local/bin/zp              简写命令（加入 PATH 的软链）
 ```
 
 ZenProxy只有两个常驻服务：

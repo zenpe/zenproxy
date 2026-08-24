@@ -133,8 +133,13 @@ validate_port() {
   [[ "$port" =~ ^[1-9][0-9]*$ && ${#port} -le 5 ]] && (( 10#$port <= 65535 ))
 }
 
+require_tty() {
+  [[ -t 0 ]] || die "需要交互输入，但标准输入不是终端（可能通过 curl | bash 管道运行）。\n  交互使用：请在本机终端运行（sudo）zp。\n  非交互使用：为所需参数显式传值并加 --yes。"
+}
+
 prompt_value() {
   local prompt=$1 default=${2:-} result
+  require_tty
   if [[ -n "$default" ]]; then
     read -r -p "$prompt [$default]: " result
     result=${result:-$default}
@@ -147,6 +152,7 @@ prompt_value() {
 confirm() {
   local prompt=$1 answer
   (( ASSUME_YES )) && return 0
+  require_tty
   read -r -p "$prompt [y/N]: " answer
   [[ "$answer" =~ ^([Yy]|[Yy][Ee][Ss]|是)$ ]]
 }
@@ -212,6 +218,7 @@ usage() {
   logs [组件]   查看最近日志（xray或cloudflared）
   update        事务更新核心程序及可选管理器
   uninstall     卸载本机 ZenProxy
+  sudoer        生成/移除当前用户免密 sudo 白名单
   version       显示版本
 
 常用选项：
@@ -237,7 +244,7 @@ EOF
 
 on_error() {
   local exit_code=$? line=${BASH_LINENO[0]:-unknown}
-  printf '%s[失败]%s 第 %s 行执行失败，退出码 %s。\n' "$C_RED" "$C_RESET" "$line" "$exit_code" >&2
+  printf '%s[失败]%s 第 %s 行执行失败，退出码 %s。命令: %s\n' "$C_RED" "$C_RESET" "$line" "$exit_code" "${BASH_COMMAND:-}" >&2
   if (( INSTALL_ACTIVE )); then
     warn "安装未完成，将回滚本次创建的本地资源和Tunnel。"
   fi
@@ -262,7 +269,7 @@ cleanup_partial_install() {
     userdel "$user" >/dev/null 2>&1
   done
   if (( MANAGER_COMMAND_INSTALLED )); then
-    rm -f /usr/local/sbin/zp /usr/local/sbin/zenproxy
+    rm -f /usr/local/sbin/zp /usr/local/sbin/zenproxy /usr/local/bin/zp
   fi
   set -e
 }
@@ -754,7 +761,8 @@ deploy_manager_command() {
   temporary=$(mktemp /usr/local/sbin/.zenproxy.XXXXXX) || return 1
   if ! install -m 0755 "$source_path" "$temporary" || \
      ! mv -f "$temporary" /usr/local/sbin/zenproxy || \
-     ! ln -sfn /usr/local/sbin/zenproxy /usr/local/sbin/zp; then
+     ! ln -sfn /usr/local/sbin/zenproxy /usr/local/sbin/zp || \
+     ! ln -sfn /usr/local/sbin/zenproxy /usr/local/bin/zp; then
     rm -f "$temporary"
     return 1
   fi
@@ -769,6 +777,8 @@ install_manager_command() {
       die "拒绝覆盖已有命令：/usr/local/sbin/zenproxy"
     [[ ! -e /usr/local/sbin/zp && ! -L /usr/local/sbin/zp ]] || \
       die "拒绝覆盖已有命令：/usr/local/sbin/zp"
+    [[ ! -e /usr/local/bin/zp && ! -L /usr/local/bin/zp ]] || \
+      die "拒绝覆盖已有命令：/usr/local/bin/zp"
   fi
   deploy_manager_command "$requested_source" || die "无法安装ZenProxy管理命令。"
   MANAGER_COMMAND_INSTALLED=1
@@ -833,7 +843,10 @@ cmd_install() {
     esac
   done
 
-  tunnel_domain=${tunnel_domain:-$(prompt_value "Cloudflare Tunnel子域名（例如 cf.example.com）")}
+  if [[ -z "$tunnel_domain" ]]; then
+    [[ -t 0 ]] || die "非交互安装必须指定 --tunnel-domain。"
+    tunnel_domain=$(prompt_value "Cloudflare Tunnel子域名（例如 cf.example.com）")
+  fi
   if [[ -z "$node_name" ]]; then
     [[ -t 0 ]] || die "非交互安装必须指定 --node-name。"
     node_name=$(prompt_value "节点名称（例如 us-la-01）")
@@ -910,6 +923,9 @@ cmd_install() {
   log
   info "下一步：确认安全组放行 TCP $vless_port 和 UDP $hy2_port。"
   info "运行 sudo zp check 验证三条线路，运行 sudo zp info --clash 获取Mihomo节点。"
+  log
+  info "管理命令：sudo zp（已加入 PATH，无需记完整路径）"
+  info "如需免除 sudo 密码：sudo zp sudoer"
 }
 
 all_services() {
@@ -1322,6 +1338,8 @@ cmd_export() {
   [[ -d "$parent" ]] || die "导出目录的上级目录不存在：$parent"
   [[ ! -e "$output" && ! -L "$output" ]] || die "导出目录已经存在，请指定一个新目录：$output"
   mkdir -m 0700 -- "$output"
+  real_user="${SUDO_USER:-$USER}"
+  [[ -n "$real_user" ]] && chown -R "$real_user:" "$output"
   build_node_links
   {
     printf '%s\n' "$CF_LINK"
@@ -1600,6 +1618,7 @@ menu_pause() {
 
 interactive_menu() {
   local choice
+  require_tty
   while true; do
     clear 2>/dev/null || true
     show_banner
@@ -1645,6 +1664,36 @@ EOF
   done
 }
 
+sudoer_whitelist_file="/etc/sudoers.d/zenproxy"
+
+cmd_sudoer() {
+  require_root
+  local remove=0 arg
+  while (($#)); do
+    arg=$1
+    case "$arg" in
+      --remove|-r) remove=1 ;;
+      *) die "未知sudoer选项：$arg" ;;
+    esac
+    shift
+  done
+  local user="${SUDO_USER:-$USER}"
+  [[ -n "$user" ]] || die "无法确定当前用户。"
+  if (( remove )); then
+    rm -f "$sudoer_whitelist_file"
+    ok "已移除 sudoers 白名单：$sudoer_whitelist_file"
+    return 0
+  fi
+  printf '%s ALL=(root) NOPASSWD: /usr/local/sbin/zenproxy\n' "$user" >"$sudoer_whitelist_file"
+  chmod 0440 "$sudoer_whitelist_file"
+  if command -v visudo >/dev/null 2>&1; then
+    visudo -cf "$sudoer_whitelist_file" >/dev/null 2>&1 || { rm -f "$sudoer_whitelist_file"; die "sudoers 语法校验失败，已回滚。"; }
+  fi
+  ok "已创建 sudoers 白名单：$sudoer_whitelist_file"
+  info "用户 $user 现在可免密运行：sudo /usr/local/sbin/zenproxy 或 sudo zp"
+  info "如需移除：sudo $(basename "$0") sudoer --remove"
+}
+
 main() {
   local command=${1:-}
   if [[ -z "$command" ]]; then
@@ -1662,6 +1711,7 @@ main() {
     start|stop|restart) cmd_service_action "$command" "$@" ;;
     logs) cmd_logs "${1:-all}" ;;
     update) cmd_update "$@" ;;
+    sudoer) cmd_sudoer "$@" ;;
     uninstall) cmd_uninstall "$@" ;;
     version|--version|-v) log "ZenProxy $ZP_VERSION" ;;
     help|--help|-h) usage ;;
